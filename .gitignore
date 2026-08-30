@@ -1,0 +1,17 @@
+# Local model weights
+*.pt
+*.pth
+
+# Official competition data
+datasets/train/images/
+datasets/train/labels/
+datasets/val/images/
+datasets/val/labels/
+
+# Training outputs and Python cache
+runs/
+__pycache__/
+*.py[cod]
+
+# IDE files
+.idea/
