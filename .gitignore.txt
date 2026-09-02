@@ -253,4 +253,19 @@ outputs/videos/*
 *.xz
 *.tgz
 
+# ---- 机器学习模型权重与检查点（单个文件可能超过 100MB，必须忽略） ----
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.weights
+*.pb
+*.onnx
+*.model
+*.params
+*.joblib
+*.mar
+*.trt
+
 参赛选手承诺书.pdf
