@@ -16,8 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # 训练（三模态五通道融合入口；命令变体见 main.py 顶部文档字符串）
 uv run python main.py
 
-# 断点续训（路径以 main.py 文档字符串为准）
-yolo detect train resume=True model="runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt"
+# 断点续训：把 main.py 顶部 RESUME_PATH 设为
+# runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt 后运行；五通道模型不能走普通 yolo CLI
+uv run python main.py
 
 # 测试
 uv run pytest tests/
@@ -49,13 +50,13 @@ datasets/                       # 落位后的训练数据（不入库，仅 dat
 └── multimodal_new_labels/      # 三模态训练集：新版标注 + 同划分（准备三模态数据集.py 构建）
 ```
 
-数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1744 / val 256（约 12.8%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开）；每类最小场景组预留给 val，保证 12 类双侧覆盖。**注意：纯数字 ID 中存在带前缀场景的重发版**，初次划分因此有 6 张 val 图与 train 同场景，已于 2026-09-15 复检并修正（train 侧 16 帧移入 val，见 `docs/数据集成分与划分记录.md` 第 7 节）。划分脚本已删除（可从 git 历史 `ebf0b47` 恢复）；若重建划分：验证集只能从训练集内部划，相邻/相同场景的样本不要分跨两侧，且必须按**内容**（近似重复扫描）而非仅文件名判断同场景，否则重复内容会被分到两侧、使 val 分数虚高。2026-09-15 起正式训练切到 `datasets/multimodal_new_labels/`（新版标注 new_labels_2000，复用 1744/256 划分；旧 `train/val` 副本保持不动），配置依据与复核结论见 `docs/训练配置与数据集复核.md`。
+数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1744 / val 256（约 12.8%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开）；每类最小场景组预留给 val，保证 12 类双侧覆盖。**注意：纯数字 ID 中存在带前缀场景的重发版**，初次划分因此有 6 张 val 图与 train 同场景，已于 2026-09-15 复检并修正（train 侧 16 帧移入 val，见 `docs/数据集成分与划分记录.md` 第 7 节）。原始划分脚本已删除（彻底重划才需从 git 历史 `ebf0b47` 恢复）；日常重建三模态训练集只需运行 `准备三模态数据集.py`（复用既有 1744/256 划分，仅替换标注版本）。若彻底重划：验证集只能从训练集内部划，相邻/相同场景的样本不要分跨两侧，且必须按**内容**（近似重复扫描）而非仅文件名判断同场景，否则重复内容会被分到两侧、使 val 分数虚高。2026-09-15 起正式训练切到 `datasets/multimodal_new_labels/`（新版标注 new_labels_2000，复用 1744/256 划分；旧 `train/val` 副本保持不动），配置依据与复核结论见 `docs/训练配置与数据集复核.md`。
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
 - 深度 png 必须按原始 16-bit 位深读取（`I;16`），不能当 8-bit 灰度图；但 `depth/` 里另有 149 张 jpg 是 **8-bit RGB**（640×360），不含 16-bit 数据，读深度要按扩展名分支。
 - **各模态目录都混着两种分辨率**：png 1920×1080 与 jpg 640×360，两种词干不重叠、各自独立成样本（不是缩略图）。读数据不能假设统一尺寸。
 - `datasets/data.yaml` **不写 `path:` 键**：写了会被原样使用、不相对 yaml 解析，`path: .` 会落到当前工作目录导致 `images not found`（2026-09-15 已修）。细节见 `docs/YOLO数据集目录结构与配置规范.md`。
-- 两套标注：`datasets/{train,val}` 落位用原始版 `labels/`；三模态训练集 `datasets/multimodal_new_labels/` 用更新版 `new_labels_2000`（由 `准备三模态数据集.py` 构建，旧副本保持不动）。如需自行重划，从 git 历史恢复划分脚本（`git show ebf0b47:prepare_dataset.py`）。
+- 两套标注：`datasets/{train,val}` 落位用原始版 `labels/`；三模态训练集 `datasets/multimodal_new_labels/` 用更新版 `new_labels_2000`（由 `准备三模态数据集.py` 构建，旧副本保持不动）。**切换标注版本**：改 `准备三模态数据集.py` 的 `main()` 里 `new_labels` 源路径（现为 `数据集/训练集/new_labels_2000`）后重跑；彻底重划才需从 git 历史恢复旧划分脚本（`git show ebf0b47:prepare_dataset.py`）。
 
 ## 提交格式与比赛硬性约束
 
@@ -100,7 +101,7 @@ datasets/                       # 落位后的训练数据（不入库，仅 dat
 
 - `docs/电脑训练环境.md` —— 本机训练环境记录（CPU/GPU/内存/SSD、CUDA 与 torch 版本、uv 依赖解析结果）
 - `docs/数据集成分与划分记录.md` —— 数据集成分、划分方法与类别分布统计（两套标注差异、重建方式）
-- `docs/训练配置与数据集复核.md` —— 三模态融合训练的配置依据与数据集复核结论（官方 PNG 1920×1080 / 红外与深度 640×360 需上采样对齐等）
+- `docs/训练配置与数据集复核.md` —— 三模态融合训练的配置依据与数据集复核结论（同名三模态尺寸一致：1851 组 PNG 为 1920×1080、149 组 JPG 为 640×360；五通道烟雾训练实测）
 - `docs/YOLO训练通用经验.md` —— 训练/标注/复盘全流程实战经验与脚本模板（配对清洗、预标注、断点续训、results.csv 复盘等）
 - `docs/YOLO数据集目录结构与配置规范.md` —— YOLO 数据集目录与 yaml 规范
 - `docs/Ultralytics训练参数参考.md` —— 训练与增强参数速查（`main.py` 的注释即逐项对应此表）

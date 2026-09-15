@@ -18,7 +18,7 @@
 - `uv run python main.py`：开始训练（在项目根目录执行）。
 - `uv run pytest tests/`：运行测试。
 - `uv run python 准备三模态数据集.py`：重建 `datasets/multimodal_new_labels`。
-- 断点续训：`yolo detect train resume=True model="runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt"`（以 `main.py` 文档字符串为准）。
+- 断点续训：把 `main.py` 顶部 `RESUME_PATH` 设为 `runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt` 后运行 `uv run python main.py`（五通道模型必须用自定义训练器，不能走普通 YOLO CLI）。
 
 ## 代码风格与命名规范
 
