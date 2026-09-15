@@ -1,6 +1,6 @@
 """使用 orgin_models 中的官方预训练权重训练目标检测模型。
 
-已逐项写入「比赛资料/Ultralytics训练参数参考.md」列出的 83 个训练与增强参数。
+已逐项写入「docs/Ultralytics训练参数参考.md」列出的 83 个训练与增强参数。
 当前安装的 Ultralytics 还提供 split、save_json、conf、iou、dnn 等验证细节参数；
 它们不在该参考清单内，因此沿用框架默认值。
 在项目目录执行 uv run python main.py 开始训练。

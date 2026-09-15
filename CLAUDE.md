@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 2026 第八届 AIC 全球校园 AI 算法精英大赛参赛项目：**面向城市场景的视觉多模态目标检测**（算法挑战赛道）。
 
-任务：对空间对齐的三模态图像（RGB 可见光 / 红外 / 深度）做 12 类目标检测，输出每张测试图的检测框 TXT。排行榜指标为 `mAP@50-95`。赛题权威参考：`比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md`。
+任务：对空间对齐的三模态图像（RGB 可见光 / 红外 / 深度）做 12 类目标检测，输出每张测试图的检测框 TXT。排行榜指标为 `mAP@50-95`。赛题权威参考：`docs/比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md`。
 
 **当前进度**：RGB-only 基线（`main.py` 为唯一训练代码，用 YOLO26m 训练 visible 图像），数据已划分落位可直接开训。多模态融合、推理生成提交 TXT、打包脚本均未实现。
 
@@ -23,7 +23,7 @@ python main.py
 yolo detect val data=datasets/data.yaml model=runs/detect/"AI COMP"/weights/best.pt
 ```
 
-环境：Windows 11 + RTX 5080 16G，ultralytics 8.4.x（YOLO26），torch 2.9.1+cu130，`device=0`。
+环境：Windows 11 + RTX 5080 16G，ultralytics 8.4.x（YOLO26），torch 2.14.0+cu132，`device=0`。依赖由 `uv` 管理（`pyproject.toml` + `uv.lock`），完整机器配置见 `docs/电脑训练环境.md`。
 
 ## 数据布局
 
@@ -71,7 +71,7 @@ datasets/                       # 落位后的训练数据（train/val 划分 + 
 ## 代码与仓库约定
 
 - `.gitignore` 已显式排除数据集目录（`数据集/`、`datasets/`）、训练输出（`runs/`）、`*.cache` 及图片/txt/权重等——仓库只跟踪代码和文档，**严禁 git add 数据集或大文件**（GitHub 单文件上限 100MB；历史上曾因暂存数据集使 .git 膨胀到 17GB，2026-09-04 已清理重写）。唯一例外：`datasets/data.yaml`（12 类配置，训练必需）。
-- `比赛资料/视频讲解.mp4`、`比赛资料/参赛选手承诺书.pdf` 仅存于磁盘，不入库。
+- `docs/比赛资料/视频讲解.mp4`、`docs/比赛资料/参赛选手承诺书.pdf` 仅存于磁盘，不入库。
 - 训练输出在 `runs/detect/AI COMP/`（`main.py` 中 `name="AI COMP"`）。
 - 远程仓库：`origin = github.com/crazyzzpdt/AICOMP`（主分支 `main`，普通 push 即可，勿用 force）。
 - 团队文档与提交信息使用中文，新增文档、注释请保持中文。
@@ -85,9 +85,12 @@ datasets/                       # 落位后的训练数据（train/val 划分 + 
 
 ## 参考文档
 
+- `docs/电脑训练环境.md` —— 本机训练环境记录（CPU/GPU/内存/SSD、CUDA 与 torch 版本、uv 依赖解析结果）
 - `docs/数据集成分与划分记录.md` —— 数据集成分、划分方法与类别分布统计（两套标注差异、重建方式）
 - `docs/YOLO训练通用经验.md` —— 训练/标注/复盘全流程实战经验与脚本模板（配对清洗、预标注、断点续训、results.csv 复盘等）
 - `docs/YOLO数据集目录结构与配置规范.md` —— YOLO 数据集目录与 yaml 规范
-- `比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md` —— 赛题手册（任务定义、类别表、评分规则、赛程、材料要求）
-- `比赛资料/官方赛题规则.md` —— 官方规则页正文**原文**（2026-09-15 抓取自 https://www.aicomp.cn/tracks/tracks-1/3700.html ，未改写；含数据格式细节、mAP 计算口径、各阶段提交清单、参考文献、红线约束）
-- `比赛资料/视频讲解-完整内容.md` —— 官方赛题视频逐字稿（数据集设计、三阶段难度递增说明）
+- `docs/Ultralytics训练参数参考.md` —— 训练与增强参数速查（`main.py` 的注释即逐项对应此表）
+- `docs/丹方.md` —— 数据采集网站等相关资料
+- `docs/比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md` —— 赛题手册（任务定义、类别表、评分规则、赛程、材料要求）
+- `docs/比赛资料/官方赛题规则.md` —— 官方规则页正文**原文**（2026-09-15 抓取自 https://www.aicomp.cn/tracks/tracks-1/3700.html ，未改写；含数据格式细节、mAP 计算口径、各阶段提交清单、参考文献、红线约束）
+- `docs/比赛资料/视频讲解-完整内容.md` —— 官方赛题视频逐字稿（数据集设计、三阶段难度递增说明）
