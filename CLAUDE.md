@@ -19,7 +19,7 @@ python main.py
 # 断点续训：把 main.py 中 YOLO(...) 改为加载 runs/detect/"AI COMP"/weights/last.pt，
 # 并加 resume=True，其余参数照旧
 
-# 验证（需先解决下方数据布局问题 + 训练产出权重）
+# 验证（需先训练产出权重）
 yolo detect val data=datasets/data.yaml model=runs/detect/"AI COMP"/weights/best.pt
 ```
 
@@ -45,8 +45,9 @@ datasets/                       # 落位后的训练数据（train/val 划分 + 
 数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1744 / val 256（约 12.8%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开）；每类最小场景组预留给 val，保证 12 类双侧覆盖。**注意：纯数字 ID 中存在带前缀场景的重发版**，初次划分因此有 6 张 val 图与 train 同场景，已于 2026-09-15 复检并修正（train 侧 16 帧移入 val，见 `docs/数据集成分与划分记录.md` 第 7 节）。划分脚本已删除（可从 git 历史 `ebf0b47` 恢复）；若重建划分：验证集只能从训练集内部划，相邻/相同场景的样本不要分跨两侧，且必须按**内容**（近似重复扫描）而非仅文件名判断同场景，否则重复内容会被分到两侧、使 val 分数虚高。
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
-- 深度图必须按原始 16-bit 位深读取，不能当 8-bit 灰度图。
-- **两个模态目录都混着两种分辨率**：png 1920×1080 与 jpg 640×360，两种词干不重叠、各自独立成样本（不是缩略图）。读数据不能假设统一尺寸。
+- 深度 png 必须按原始 16-bit 位深读取（`I;16`），不能当 8-bit 灰度图；但 `depth/` 里另有 149 张 jpg 是 **8-bit RGB**（640×360），不含 16-bit 数据，读深度要按扩展名分支。
+- **各模态目录都混着两种分辨率**：png 1920×1080 与 jpg 640×360，两种词干不重叠、各自独立成样本（不是缩略图）。读数据不能假设统一尺寸。
+- `datasets/data.yaml` **不写 `path:` 键**：写了会被原样使用、不相对 yaml 解析，`path: .` 会落到当前工作目录导致 `images not found`（2026-09-15 已修）。细节见 `docs/YOLO数据集目录结构与配置规范.md`。
 - 两套标注：当前使用原始版 `labels/`；如需切换到更新版 `new_labels_2000`，从 git 历史恢复划分脚本（`git show ebf0b47:prepare_dataset.py`），改顶部 `LABEL_SUBDIR` 后重跑。
 
 ## 提交格式与比赛硬性约束
