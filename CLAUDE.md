@@ -29,13 +29,15 @@ yolo detect val data=datasets/data.yaml model=runs/detect/"AI COMP"/weights/best
 
 ```text
 数据集/                        # 官方数据（.gitignore 已忽略）
-├── 训练集/AIC2026_Train_2000/  # 2000 组训练数据（有标注）
-│   ├── visible/                # RGB 8-bit，00000004.jpg …（jpg 149 + png 1611）
-│   ├── infrared/               # 红外（存为三通道，本质同一热度灰度图复制三份）
-│   ├── depth/                  # 深度 16-bit，单位毫米；0 或极小值 = 无效深度
-│   ├── labels/                 # 原始标注（2026-04-15 下载，当前落位使用此版）
+├── 训练集/
+│   ├── AIC2026_Train_2000/     # 2000 组训练数据（有标注）
+│   │   ├── visible/            # RGB 8-bit，png 1851（1920×1080）+ jpg 149（640×360）
+│   │   ├── infrared/           # 红外（存为三通道，本质同一热度灰度图复制三份）
+│   │   ├── depth/              # 深度 16-bit（I;16），单位毫米；0 或极小值 = 无效深度
+│   │   └── labels/             # 原始标注（2026-04-15 下载，当前落位使用此版）
 │   └── new_labels_2000/        # 更新版标注（2026-09-02）：382/2000 文件有差异，以增框为主
 └── 测试集/AIC2026_PHASE_1_1000/  # 1000 组初赛测试数据（无标注），visible/infrared/depth
+                                  #   png 845（1920×1080）+ jpg 155（640×360）
 
 datasets/                       # 落位后的训练数据（train/val 划分 + data.yaml）
 ```
@@ -44,6 +46,7 @@ datasets/                       # 落位后的训练数据（train/val 划分 + 
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
 - 深度图必须按原始 16-bit 位深读取，不能当 8-bit 灰度图。
+- **两个模态目录都混着两种分辨率**：png 1920×1080 与 jpg 640×360，两种词干不重叠、各自独立成样本（不是缩略图）。读数据不能假设统一尺寸。
 - 两套标注：当前使用原始版 `labels/`；如需切换到更新版 `new_labels_2000`，从 git 历史恢复划分脚本（`git show ebf0b47:prepare_dataset.py`），改顶部 `LABEL_SUBDIR` 后重跑。
 
 ## 提交格式与比赛硬性约束
