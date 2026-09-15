@@ -57,7 +57,7 @@ if __name__ == "__main__":
         epochs=400,  # 有限的完整训练预算：360 轮增强训练 + 40 轮关闭 Mosaic 收敛
         time=None,  # 最大训练小时数；设置后覆盖 epochs 限制
         patience=0,  # 禁用早停，保证走完学习率下降和关闭 Mosaic 阶段；最终使用 best.pt
-        batch=4,  # 本机 1280/BF16/MuSGD 合成密集批次实测峰值约 10.9 GiB 已分配显存
+        batch=4,  # 本机五通道 1280/BF16/MuSGD 短训峰值已分配 10.89 GiB、保留 11.87 GiB
         imgsz=1280,  # 32 的整数倍；相比 960，提高小目标在输入图中的有效像素数
         fraction=1.0,  # 使用全部数据；也可指定比例、数量或各拆分的列表
         single_cls=False,  # 不将所有类别合并为一个类别
@@ -66,7 +66,7 @@ if __name__ == "__main__":
         # 二、设备、性能与可复现性
         device=0,  # PyTorch 中的 CUDA 设备编号（本机 RTX 5080）
         workers=4,  # 9950X 的 4 个加载进程，兼顾供数速度和 Windows 子进程内存开销
-        cache="disk",  # NVMe 缓存融合后的五通道图像；不启用整集 RAM 缓存
+        cache="disk",  # 五通道完整原尺寸缓存约 18 GiB；本机可用内存约 16 GiB，采用磁盘缓存
         amp="bf16",  # RTX 5080 原生支持；本机已验证有限损失和梯度，且无需 FP16 的缩放器
         quantize=None,  # None 关闭量化感知训练；8/"int8" 开启 QAT
         seed=0,  # 随机种子
@@ -84,7 +84,7 @@ if __name__ == "__main__":
         name="AIC_RGBIRDepth_yolo26l_1280",  # 区分三模态融合、模型规格和输入尺寸
         exist_ok=False,  # 同名目录已存在时自动递增运行目录名
         save_dir=None,  # 指定确切输出目录会覆盖 project/name，且不自动递增
-        resume=False,  # 初始训练不续训；恢复训练请使用文件顶部的 last.pt 命令
+        resume=False,  # 首次训练；续训在上方 RESUME_PATH 填写 last.pt，由独立分支恢复
 
         # 四、优化器、学习率与预热
         optimizer="MuSGD",  # 显式使用 YOLO26 长周期训练优化器，避免 auto 随轮数切换配方
