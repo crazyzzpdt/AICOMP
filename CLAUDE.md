@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 任务：对空间对齐的三模态图像（RGB 可见光 / 红外 / 深度）做 12 类目标检测，输出每张测试图的检测框 TXT。排行榜指标为 `mAP@50-95`。赛题权威参考：`比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md`。
 
-**当前进度**：RGB-only 基线（`main.py` 用 YOLO26m 训练 visible 图像），数据已划分落位（`prepare_dataset.py`，可直接开训）。多模态融合、推理生成提交 TXT、打包脚本均未实现。
+**当前进度**：RGB-only 基线（`main.py` 为唯一训练代码，用 YOLO26m 训练 visible 图像），数据已划分落位可直接开训。多模态融合、推理生成提交 TXT、打包脚本均未实现。
 
 ## 常用命令
 
@@ -40,11 +40,11 @@ yolo detect val data=datasets/data.yaml model=runs/detect/"AI COMP"/weights/best
 datasets/                       # 落位后的训练数据（train/val 划分 + data.yaml）
 ```
 
-数据已由 `prepare_dataset.py` 落位（可重复运行，运行即重建划分）：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1760 / val 240（约 12%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开），同场景绝不跨集；每类最小场景组预留给 val，保证 12 类双侧覆盖。若重建划分，遵守原则：验证集只能从训练集内部划分，相邻/相同场景的样本不要分跨两侧，避免分数虚高。完整成分统计见 `docs/数据集成分与划分记录.md`。
+数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1760 / val 240（约 12%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开），同场景绝不跨集；每类最小场景组预留给 val，保证 12 类双侧覆盖。划分脚本已删除（可从 git 历史 `ebf0b47` 恢复）；若重建划分：验证集只能从训练集内部划，相邻/相同场景的样本不要分跨两侧，避免分数虚高。完整成分统计见 `docs/数据集成分与划分记录.md`。
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
 - 深度图必须按原始 16-bit 位深读取，不能当 8-bit 灰度图。
-- 两套标注：`prepare_dataset.py` 顶部 `LABEL_SUBDIR` 常量可切换（`"labels"` 原始版 / `"new_labels_2000"` 更新版），改后重跑脚本即重建。
+- 两套标注：当前使用原始版 `labels/`；如需切换到更新版 `new_labels_2000`，从 git 历史恢复划分脚本（`git show ebf0b47:prepare_dataset.py`），改顶部 `LABEL_SUBDIR` 后重跑。
 
 ## 提交格式与比赛硬性约束
 
@@ -66,10 +66,11 @@ datasets/                       # 落位后的训练数据（train/val 划分 + 
 - 行注释：简洁中文、紧邻所解释代码（通常在上方）；只写代码本身表达不了的内容（业务目的与固定值、前置条件与顺序、等待/重试/超时边界、数据校验与关键副作用）；不复述代码，删掉后含义仍明确的注释不要写。
 - 日志/打印必须具体到对象和结果（如 `预标注完成，共产出 N 个框`），不写干巴巴的"成功/失败"。
 - 提交信息：简短、祈使式中文摘要（如 `补充忽略规则`），每个提交只处理一个明确目标。
+- **例外——训练入口**：`main.py` 的代码与注释风格单独遵循 `D:\YOLO 数据集\火灾检测\模型训练和导出.py`：文件开头用 `r"""训练指令"""` 文档字符串块收纳 CLI 命令变体并分节（训练/断点续训/推理）、`if __name__ == '__main__':` 入口保护直排（不封装函数）、train() 全参数中文长句注释、底部注释形式保留断点续训变体；该文件不适用类型提示与函数封装要求。
 
 ## 代码与仓库约定
 
-- `.gitignore` 已显式排除数据集目录（`数据集/`、`训练集/`、`测试集/`）、训练输出（`runs/`）、`*.cache` 及图片/txt/权重等——仓库只跟踪代码和文档，**严禁 git add 数据集或大文件**（GitHub 单文件上限 100MB；历史上曾因暂存数据集使 .git 膨胀到 17GB，2026-09-04 已清理重写）。
+- `.gitignore` 已显式排除数据集目录（`数据集/`、`datasets/`）、训练输出（`runs/`）、`*.cache` 及图片/txt/权重等——仓库只跟踪代码和文档，**严禁 git add 数据集或大文件**（GitHub 单文件上限 100MB；历史上曾因暂存数据集使 .git 膨胀到 17GB，2026-09-04 已清理重写）。唯一例外：`datasets/data.yaml`（12 类配置，训练必需）。
 - `比赛资料/视频讲解.mp4`、`比赛资料/参赛选手承诺书.pdf` 仅存于磁盘，不入库。
 - 训练输出在 `runs/detect/AI COMP/`（`main.py` 中 `name="AI COMP"`）。
 - 远程仓库：`origin = github.com/crazyzzpdt/AICOMP`（主分支 `main`，普通 push 即可，勿用 force）。
