@@ -44,7 +44,12 @@ names:
 
 说明：
 
-- 路径写相对路径（相对 yaml 所在目录），Ultralytics 会以 yaml 位置为基准解析；也可写绝对路径。
+- **不要写 `path:` 键**，只写 `train / val / test` 的相对路径即可。Ultralytics 取基准目录的顺序是
+  `extract_dir → yaml 的 path 键 → yaml 所在目录`（`data/utils.py: check_det_dataset`），只有前两者都取不到时才用 yaml 所在目录。
+  一旦写了 `path:`，其值会被**原样使用**，并**不**相对 yaml 解析；仅当该路径不存在且是相对路径时，才回退到全局设置 `datasets_dir`（见 `yolo settings`）。
+- 由此产生最典型的坑是 `path: .`：`.` 恒为「存在」，不会触发回退，基准于是落在**当前工作目录**上，
+  训练时报 `Dataset 'xxx.yaml' images not found`。2026-09-15 本项目 `datasets/data.yaml` 即踩此坑（已删除该行）。
+- 确需显式指定基准时写**绝对路径**；相对路径（含 `.`、`./datasets`）的语义会随 CWD 与 `datasets_dir` 漂移，不要依赖。
 - `names` 用 `类别索引: 类别名`，索引与标注 txt 中每行第一个数字对应。
 - 类别索引从 0 开始；类别顺序一经训练就固定，不要中途调换或增删。
 - 只需训练/验证时可省略 `test:` 一行。

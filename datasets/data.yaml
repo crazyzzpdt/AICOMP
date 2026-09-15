@@ -1,4 +1,6 @@
-path: .
+# 不写 path 键：Ultralytics 对 path 的取值只做「原样使用 + 不存在才相对 datasets_dir 解析」，
+# 写 path: . 会被解析成当前工作目录（而非本 yaml 所在目录），训练时报 images not found。
+# 省略 path 时框架回落到本文件所在目录，train/val 相对路径即以此为准。
 train: train/images
 val: val/images
 
