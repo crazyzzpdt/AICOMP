@@ -17,3 +17,8 @@ torchvision = { index = "pytorch-cu132" }
 [[tool.uv.index]]
 name = "pytorch-cu132"
 url = "https://download.pytorch.org/whl/cu132"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
