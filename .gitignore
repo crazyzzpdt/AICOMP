@@ -186,15 +186,8 @@ __marimo__/
 .run/
 data/
 debug_data/
-# 忽略 outputs 下所有子目录的内容（但保留目录结构本身）
-outputs/downloads/*
-outputs/har/*
-outputs/logs/*
-outputs/pyinstaller/*
-outputs/reports/*
-outputs/screenshots/*
-outputs/traces/*
-outputs/videos/*
+# outputs/ 是验证与烟雾检查产物目录（日志、曲线图、检查点权重等运行产物），整体不入库
+outputs/
 
 # ========================================
 # 保留 .gitkeep 文件（用于追踪空目录）
