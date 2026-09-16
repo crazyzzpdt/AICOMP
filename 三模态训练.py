@@ -6,12 +6,14 @@
 # 内置库
 import math
 from copy import copy
+from functools import partial
 from pathlib import Path
 
 # 三方库
 import cv2
 import numpy as np
 import torch
+from ultralytics.data.build import InfiniteDataLoader, seed_worker
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import get_hash
 from ultralytics.models.yolo.detect.train import DetectionTrainer
@@ -20,7 +22,12 @@ from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
 
 
+# 沿用既有深度编码上限，本轮不同时改变深度尺度。
 DEPTH_MAX_MM: int = 20_000
+# 旧运行 73 轮达到最佳、之后长期停滞；将衰减周期与总轮数上限分开。
+LR_DECAY_EPOCHS: int = 200
+# 每个进程至多保留 8 张缩放图，降低五通道 Mosaic 缓冲占用。
+IMAGE_BUFFER_LIMIT: int = 8
 
 
 # 一、三模态图像读取与融合
@@ -85,8 +92,8 @@ def normalize_depth_channel(depth: np.ndarray) -> np.ndarray:
 def adapt_rgb_stem_weights(source: torch.Tensor, target_channels: int) -> torch.Tensor:
     """将 RGB 预训练首层权重扩展为多通道输入权重。
 
-    原有 RGB 通道与新增模态通道均按目标通道数缩放，使首层在输入各通道
-    具有相近均值时维持原始激活幅度；红外和深度通道以 RGB 权重均值初始化。
+    原有 RGB 权重完整保留，新增模态权重从零开始学习，避免初始时红外、深度
+    直接改变 COCO 预训练响应；零初始化的新增输入权重仍可正常获得梯度。
 
     Args:
         source: 形状为 ``[输出通道, 3, 卷积高, 卷积宽]`` 的 RGB 预训练权重。
@@ -103,12 +110,10 @@ def adapt_rgb_stem_weights(source: torch.Tensor, target_channels: int) -> torch.
     if target_channels < 3:
         raise ValueError("目标输入通道数不能少于三")
 
-    scale = 3.0 / target_channels
-    rgb_weights = source * scale
     if target_channels == 3:
-        return rgb_weights
-    modality_weights = source.mean(dim=1, keepdim=True).repeat(1, target_channels - 3, 1, 1) * scale
-    return torch.cat((rgb_weights, modality_weights), dim=1)
+        return source.clone()
+    modality_weights = source.new_zeros((source.shape[0], target_channels - 3, *source.shape[2:]))
+    return torch.cat((source, modality_weights), dim=1)
 
 
 def fuse_modalities(visible_path: Path, infrared_path: Path, depth_path: Path) -> np.ndarray:
@@ -157,11 +162,15 @@ class MultimodalYOLODataset(YOLODataset):
         """
         if data.get("channels") != 5:
             raise ValueError("三模态早期融合训练的数据集 channels 必须为 5")
-        self.infrared_dir = Path(str(data["infrared"])).resolve()
-        self.depth_dir = Path(str(data["depth"])).resolve()
+        data_root = Path(str(data.get("path", Path.cwd()))).resolve()
+        infrared_dir = Path(str(data["infrared"]))
+        depth_dir = Path(str(data["depth"]))
+        self.infrared_dir = (data_root / infrared_dir).resolve() if not infrared_dir.is_absolute() else infrared_dir
+        self.depth_dir = (data_root / depth_dir).resolve() if not depth_dir.is_absolute() else depth_dir
         if not self.infrared_dir.is_dir() or not self.depth_dir.is_dir():
-            raise FileNotFoundError("红外或深度图目录不存在，请检查 datasets/multimodal_new_labels/data.yaml")
+            raise FileNotFoundError("红外或深度图目录不存在，请检查 datasets/data.yaml")
         super().__init__(*args, data=data, **kwargs)
+        self.max_buffer_length = min(self.max_buffer_length, IMAGE_BUFFER_LIMIT)
 
     def get_label_files(self) -> list[str]:
         """建立可见光图、红外图、深度图与新版标签的同名映射。"""
@@ -263,8 +272,58 @@ class MultimodalYOLODataset(YOLODataset):
 
 
 # 三、三模态训练器
+def learning_rate_factor(epoch: int, decay_epochs: int, final_ratio: float, cosine: bool) -> float:
+    """按独立收敛周期衰减学习率，到达下限后保持不反弹。"""
+    progress: float = min(max(epoch / max(decay_epochs, 1), 0.0), 1.0)
+    remaining: float = (1.0 + math.cos(math.pi * progress)) / 2.0 if cosine else 1.0 - progress
+    return final_ratio + (1.0 - final_ratio) * remaining
+
+
 class MultimodalDetectionTrainer(DetectionTrainer):
     """构建五通道数据集，并将 RGB 预训练首层迁移到三模态模型。"""
+
+    # 框架生命周期方法名必须与父类一致。
+    def _setup_scheduler(self) -> None:
+        """保留训练轮数上限，将实际学习率衰减限制在前 200 轮。"""
+        self.lf = partial(
+            learning_rate_factor,
+            decay_epochs=min(self.epochs, LR_DECAY_EPOCHS),
+            final_ratio=self.args.lrf,
+            cosine=self.args.cos_lr,
+        )
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
+
+    def get_dataloader(
+        self, dataset_path: str, batch_size: int = 16, rank: int = -1, mode: str = "train"
+    ) -> InfiniteDataLoader:
+        """为本机单卡构建低预取加载器，验证进程数不再翻倍。
+
+        Note:
+            五通道增强曾出现 CPU 内存分配失败，因此每个进程仅预取一批，关闭锁页。
+            当前实现限定单卡训练；Windows 多进程入口仍由 main.py 保护。
+        """
+        if rank != -1:
+            raise ValueError("当前三模态加载器面向本机单卡，请使用 device=0")
+        if mode not in {"train", "val"}:
+            raise ValueError(f"不支持的数据加载模式：{mode}")
+        dataset = self.build_dataset(dataset_path, mode, batch_size)
+        batch_size = min(batch_size, len(dataset))
+        shuffle: bool = mode == "train" and not dataset.rect
+        workers: int = min(self.args.workers, math.ceil(len(dataset) / batch_size))
+        generator = torch.Generator().manual_seed(self.args.seed)
+        LOGGER.info(f"{mode}: 加载进程 {workers}，每进程预取 1 批，锁页内存关闭")
+        return InfiniteDataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=workers,
+            prefetch_factor=1 if workers else None,
+            pin_memory=False,
+            collate_fn=dataset.collate_fn,
+            worker_init_fn=seed_worker,
+            generator=generator,
+            drop_last=bool(self.args.compile and mode == "train"),
+        )
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None) -> MultimodalYOLODataset:
         """构建保持三模态空间同步增强的检测数据集。"""
@@ -293,8 +352,17 @@ class MultimodalDetectionTrainer(DetectionTrainer):
             DetectionModel(cfg, nc=self.data["nc"], ch=5, verbose=verbose and RANK == -1)
         )
         if weights:
-            model.load(weights)
             source_model = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights
+            # 仅复制模型外壳与名称表，复用权重；不改原检查点名称或比赛类别编号。
+            load_source = copy(source_model)
+            source_names: dict[int, str] = dict(source_model.names)
+            if self.args.cls_remap and source_model.model[0].conv.in_channels == 3:
+                for class_id, class_name in source_names.items():
+                    if class_name.strip().lower() == "sports ball" and "ball" not in source_names.values():
+                        source_names[class_id] = "ball"
+                        LOGGER.info("预训练类别迁移：sports ball → ball（比赛类别编号保持不变）")
+            load_source.names = source_names
+            model.load(load_source, verbose=verbose)
             source_weights = source_model.float().state_dict()["model.0.conv.weight"]
             target_weights = model.state_dict()["model.0.conv.weight"]
             # 五通道检查点直接恢复；只有首次从 RGB 权重训练时扩展首层。

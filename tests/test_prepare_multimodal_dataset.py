@@ -27,10 +27,10 @@ def test_prepare_multimodal_dataset_uses_new_labels_and_ignores_old_cache(tmp_pa
         (raw_dataset / "depth" / f"{stem}.png").write_bytes(b"depth")
         (new_labels / f"{stem}.txt").write_text("1 0.2 0.2 0.2 0.2\n", encoding="utf-8")
 
-    output = prepare_multimodal_dataset(old_dataset, raw_dataset, new_labels, tmp_path / "multimodal_new_labels")
+    output = prepare_multimodal_dataset(old_dataset, raw_dataset, new_labels, old_dataset)
 
     assert (output / "train" / "images" / "sample_train.png").is_file()
     assert not (output / "train" / "images" / "sample_train.npy").exists()
     assert (output / "val" / "labels" / "sample_val.txt").read_text(encoding="utf-8").startswith("1 ")
-    assert (old_dataset / "val" / "labels" / "sample_val.txt").read_text(encoding="utf-8").startswith("0 ")
+    assert (old_dataset / "val" / "labels" / "sample_val.txt").read_text(encoding="utf-8").startswith("1 ")
     assert "channels: 5" in (output / "data.yaml").read_text(encoding="utf-8")

@@ -10,6 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **当前进度**：三模态早期融合训练已实现——`main.py`（YOLO26l，RGB 3 + 红外 1 + 深度 1 共 5 通道输入）+ `三模态训练.py`（自定义训练器）+ `准备三模态数据集.py`（新版标注数据集构建）+ `tests/`。推理生成提交 TXT、打包脚本未实现。
 
+2026-09-16 v3 调整：用户完成的 v2 运行最佳本地 mAP50-95=0.37746（第 79 轮），第 179 轮早停。当前保留 l/1280/batch=5、workers=4、AdamW、lr0=0.0003、nbs=16；MAX_EPOCHS=5000，学习率前 200 轮衰减，close_mosaic 由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算，第 101 轮关闭。新增 RGB 源名称 sports ball → ball 对应，比赛类别 ID 不变。18 项回归测试通过，v3 尚未正式训练，不能宣称精度已提高。详见 `docs/训练配置与数据集复核.md`。
+
 ## 常用命令
 
 ```bash
@@ -17,13 +19,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv run python main.py
 
 # 断点续训：把 main.py 顶部 RESUME_PATH 设为
-# runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt 后运行；五通道模型不能走普通 yolo CLI
+# runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/last.pt 后运行；仅恢复同配方运行
 uv run python main.py
 
 # 测试
 uv run pytest tests/
 
-# 重建 multimodal_new_labels 数据集（仅必要时；旧 train/val 副本不动）
+# 按既有划分重建 train/val，并使用官方新版标注
 uv run python 准备三模态数据集.py
 ```
 
@@ -46,17 +48,18 @@ uv run python 准备三模态数据集.py
                                   #   png 845（1920×1080）+ jpg 155（640×360）
 
 datasets/                       # 落位后的训练数据（不入库，仅 data.yaml 入库）
-├── train/ val/                 # 旧版标注的 1744/256 划分（硬链接，保持不动）
-└── multimodal_new_labels/      # 三模态训练集：新版标注 + 同划分（准备三模态数据集.py 构建）
+├── train/                       # 1744 张：images 与新版 labels
+├── val/                         # 256 张：images 与新版 labels
+└── data.yaml                    # RGB / 红外 / 深度五通道配置
 ```
 
-数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `data.yaml` 对应，train 1744 / val 256（约 12.8%）。图像是指向 `数据集/训练集/` 的**硬链接**（同盘零拷贝，删任一侧不丢数据，两侧都删才会丢）。划分按"场景组"原子切分：文件名前缀组（如 `000006_010_xxx`、`shuming_985_xxx`）+ 纯数字连续段（间隔>50 视为断界，巨型段在段内间隔最大处切开）；每类最小场景组预留给 val，保证 12 类双侧覆盖。**注意：纯数字 ID 中存在带前缀场景的重发版**，初次划分因此有 6 张 val 图与 train 同场景，已于 2026-09-15 复检并修正（train 侧 16 帧移入 val，见 `docs/数据集成分与划分记录.md` 第 7 节）。原始划分脚本已删除（彻底重划才需从 git 历史 `ebf0b47` 恢复）；日常重建三模态训练集只需运行 `准备三模态数据集.py`（复用既有 1744/256 划分，仅替换标注版本）。若彻底重划：验证集只能从训练集内部划，相邻/相同场景的样本不要分跨两侧，且必须按**内容**（近似重复扫描）而非仅文件名判断同场景，否则重复内容会被分到两侧、使 val 分数虚高。2026-09-15 起正式训练切到 `datasets/multimodal_new_labels/`（新版标注 new_labels_2000，复用 1744/256 划分；旧 `train/val` 副本保持不动），配置依据与复核结论见 `docs/训练配置与数据集复核.md`。
+数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `datasets/data.yaml` 直接对应，train 1744 / val 256（验证集约 12.8%）。图像是指向官方 visible 的硬链接，标注为官方 `new_labels_2000` 的独立副本；旧版标注仍保留在官方原始目录。划分按场景组原子切分，2026-09-15 已修正跨集同场景问题，详见 `docs/数据集成分与划分记录.md` 第 7 节。日常更新标注只需运行 `准备三模态数据集.py`；该脚本不建立第二套数据目录。
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
 - 深度 png 必须按原始 16-bit 位深读取（`I;16`），不能当 8-bit 灰度图；但 `depth/` 里另有 149 张 jpg 是 **8-bit RGB**（640×360），不含 16-bit 数据，读深度要按扩展名分支。
 - **各模态目录都混着两种分辨率**：png 1920×1080 与 jpg 640×360，两种词干不重叠、各自独立成样本（不是缩略图）。读数据不能假设统一尺寸。
 - `datasets/data.yaml` **不写 `path:` 键**：写了会被原样使用、不相对 yaml 解析，`path: .` 会落到当前工作目录导致 `images not found`（2026-09-15 已修）。细节见 `docs/YOLO数据集目录结构与配置规范.md`。
-- 两套标注：`datasets/{train,val}` 落位用原始版 `labels/`；三模态训练集 `datasets/multimodal_new_labels/` 用更新版 `new_labels_2000`（由 `准备三模态数据集.py` 构建，旧副本保持不动）。**切换标注版本**：改 `准备三模态数据集.py` 的 `main()` 里 `new_labels` 源路径（现为 `数据集/训练集/new_labels_2000`）后重跑；彻底重划才需从 git 历史恢复旧划分脚本（`git show ebf0b47:prepare_dataset.py`）。
+- `datasets/{train,val}` 使用更新版 `new_labels_2000`；原始版仅保留在 `数据集/训练集/AIC2026_Train_2000/labels`。准备脚本会原子替换落位标签，避免经硬链接改动官方旧标注。
 
 ## 提交格式与比赛硬性约束
 
@@ -86,7 +89,7 @@ datasets/                       # 落位后的训练数据（不入库，仅 dat
 
 - `.gitignore` 已显式排除数据集目录（`数据集/`、`datasets/`）、训练输出（`runs/`）、`*.cache` 及图片/txt/权重等——仓库只跟踪代码和文档，**严禁 git add 数据集或大文件**（GitHub 单文件上限 100MB；历史上曾因暂存数据集使 .git 膨胀到 17GB，2026-09-04 已清理重写）。唯一例外：`datasets/data.yaml`（12 类配置，训练必需）。
 - `docs/比赛资料/视频讲解.mp4`、`docs/比赛资料/参赛选手承诺书.pdf` 仅存于磁盘，不入库。
-- 训练输出在 `runs/detect/AIC_RGBIRDepth_yolo26l_1280/`（`main.py` 的 `name` 参数）。
+- 当前 v3 训练输出在 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/`（重名自动递增）；旧目录保存历史运行。
 - 远程仓库：`origin = github.com/crazyzzpdt/AICOMP`（主分支 `main`，普通 push 即可，勿用 force）。
 - 团队文档与提交信息使用中文，新增文档、注释请保持中文。
 

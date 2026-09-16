@@ -16,9 +16,10 @@ ROOT: Path = Path(__file__).resolve().parents[1]
 
 def test_multimodal_dataset_emits_five_channel_tensor() -> None:
     """真实训练样本须按新版标签和三模态路径生成五通道张量。"""
-    data = YAML.load(ROOT / "datasets" / "multimodal_new_labels" / "data.yaml")
+    data = YAML.load(ROOT / "datasets" / "data.yaml")
+    data["path"] = ROOT / "datasets"
     dataset = MultimodalYOLODataset(
-        img_path=str(ROOT / "datasets" / "multimodal_new_labels" / "train" / "images"),
+        img_path=str(ROOT / "datasets" / "train" / "images"),
         imgsz=64,
         batch_size=1,
         augment=False,

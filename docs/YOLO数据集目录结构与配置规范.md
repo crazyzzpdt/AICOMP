@@ -1,6 +1,16 @@
 # YOLO 数据集目录结构与配置文件规范
 
-> 适用：Ultralytics YOLO 系列训练（detect / segment / pose / classify / obb 均沿用同一组织方式）。
+> 下文目录示例以 YOLO TXT 标注任务为主；分类任务的目录组织不同。历史 fight_detector 示例不代表本项目数据。
+
+## 本项目实际目录（2026-09-16）
+
+当前配置为 `datasets/data.yaml`，训练目录仅 `datasets/train/{images,labels}` 和 `datasets/val/{images,labels}`。train/val 分别 1744/256 张，标签均为官方 `new_labels_2000` 独立副本；images 为官方 visible 硬链接，原地改写会影响原图。
+
+配置附带 `channels: 5`，红外/深度路径为 `../数据集/训练集/AIC2026_Train_2000/infrared`、`../数据集/训练集/AIC2026_Train_2000/depth`，由自定义加载器相对数据根目录解析。无需嵌套 `multimodal_new_labels`，无需在 datasets 内复制另一套红外/深度图。
+
+标签缓存位于各 split 下，五通道 NPY 缓存位于 images 内。仅 `datasets/data.yaml` 入库。日常训练不运行重建脚本；`准备三模态数据集.py` 会更新标签并清理图像缓存，不能在训练使用这些文件时运行。
+
+文件来源与标注质量是不同检查：本项目 2000 个 TXT 与官方新版相同，仍存在少量边缘框、重复行及验证分布不足，详见 [数据集成分与划分记录](数据集成分与划分记录.md)。
 
 ## 1. 标准目录结构
 
@@ -26,7 +36,7 @@
 1. `train / val / test` 三级划分；`test` 可选，最少保留 `train + val`。
 2. 每个划分下 `images/` 与 `labels/` 平级、**同名配对**：`images/xxx.jpg` ↔ `labels/xxx.txt`（仅扩展名不同）。
 3. `labels.cache` 是首次训练时由 Ultralytics 生成的标签缓存，用于加速后续训练；删除后下次训练自动重建。
-4. 配置文件命名 = 数据集目录名，训练时直接 `data=<dataset_name>.yaml` 即可。
+4. 配置文件可自行命名，训练时传入对应 YAML 路径；本项目命名为 `datasets/data.yaml`。
 
 ## 2. 数据集配置文件（yaml）
 
@@ -117,4 +127,4 @@ model.train(data="path/to/fight_detector.yaml", imgsz=640, epochs=100)
 2. 按 `images/xxx.ext ↔ labels/xxx.txt` 同名规则放入图片与标注。
 3. 写 `<name>.yaml`：train / val / test 路径 + `names` 类别表。
 4. 写 `数据分配.txt` 记录来源与去向（可选但推荐）。
-5. 校验：跑一次 `model.val(data="<name>.yaml", split="val")`，能正确统计图片数即结构无误。
+5. 校验来源、配对、类别、坐标与可视化框，再验证加载流程。统计图片数正确只能说明成功加载；本项目必须使用三模态加载器，不能用普通 RGB 验证代替。

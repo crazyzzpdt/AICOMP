@@ -6,9 +6,9 @@
 
 - `main.py`：训练入口（唯一）。YOLO26l 三模态五通道（RGB 3 + 红外 1 + 深度 1）融合检测。
 - `三模态训练.py`：自定义训练器 `MultimodalDetectionTrainer` 与五通道数据加载；由 `main.py` 导入，不可直接作为独立训练入口运行。
-- `准备三模态数据集.py`：在 `datasets/` 内非破坏性构建 `multimodal_new_labels`（新版标注 + 既有 1744/256 划分）；仅在需要重建时运行。
+- `准备三模态数据集.py`：保留既有 1744/256 图像划分，将 `datasets/train` 和 `datasets/val` 原地更新为新版标注；仅在需要重建时运行。
 - `tests/`：pytest 测试，按 `test_<模块>.py` 命名。
-- `datasets/`：落位训练数据与 `data.yaml`；仅 `datasets/data.yaml` 入库，`multimodal_new_labels/` 由脚本生成、不入库。
+- `datasets/`：仅包含 `train/`、`val/` 与必需的 `data.yaml`；仅 `datasets/data.yaml` 入库。
 - `数据集/`（官方原始数据）与 `runs/`（训练产物）不入库；`orgin_models/` 存放本地权重（不入库）。
 - `docs/`：资料、复盘与经验文档；官方赛题资料在 `docs/比赛资料/`。
 
@@ -17,8 +17,9 @@
 - `uv sync`：根据 `pyproject.toml` 和 `uv.lock` 创建或更新环境。
 - `uv run python main.py`：开始训练（在项目根目录执行）。
 - `uv run pytest tests/`：运行测试。
-- `uv run python 准备三模态数据集.py`：重建 `datasets/multimodal_new_labels`。
-- 断点续训：把 `main.py` 顶部 `RESUME_PATH` 设为 `runs/detect/AIC_RGBIRDepth_yolo26l_1280/weights/last.pt` 后运行 `uv run python main.py`（五通道模型必须用自定义训练器，不能走普通 YOLO CLI）。
+- `uv run python 准备三模态数据集.py`：使用官方新版标注更新 `datasets/train`、`datasets/val` 和五通道配置。
+- 断点续训：把 `main.py` 顶部 `RESUME_PATH` 设为本次 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/last.pt` 后运行 `uv run python main.py`。仅恢复同配方运行；更换配方时保持 `None`，因为续训会恢复检查点参数。
+- 当前配方：AdamW、lr0=0.0003、nbs=16、batch=5；MAX_EPOCHS=5000，学习率在前 200 轮衰减，close_mosaic 由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算，第 101 轮起关闭。RGB 预训练补充 sports ball → ball 名称对应。训练/验证各 4 个加载进程、每进程预取 1 批、关闭锁页。
 
 ## 代码风格与命名规范
 

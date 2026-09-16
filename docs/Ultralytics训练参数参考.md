@@ -1,5 +1,9 @@
 # Ultralytics 训练参数参考
 
+2026-09-16 项目说明：下表保留抓取时的框架默认值，不是当前训练配置。当前 v3 的实际值见 `main.py` 与 [训练配置与数据集复核](训练配置与数据集复核.md)：YOLO26l、五通道、1280、batch=5、workers=4、AdamW、lr0=0.0003、nbs=16、MAX_EPOCHS=5000、patience=100。
+
+项目自定义训练器在前 200 轮衰减学习率，不能按框架默认的总轮数推算；close_mosaic 是最后 N 轮关闭，入口由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算（默认 4900），第 101 轮关闭。sports ball → ball 是项目的预训练名称适配，并非新增 Ultralytics 参数。auto_augment、erasing 等分类参数对当前 detect 不生效。
+
 来源（2026-09-15 抓取）：
 
 - 训练模式参数：<https://docs.ultralytics.com/zh/modes/train/>

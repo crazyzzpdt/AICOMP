@@ -2,7 +2,13 @@
 
 > 沉淀自多个 YOLO 实战项目（火灾检测 fire_detector、暴力打架检测 fight_detector 等）。
 > 环境：Ultralytics 8.4.x · YOLO26 · Windows 11 · RTX 5080 16G · torch 2.9.1+cu130。
-> 所有代码改路径即可复用；目录规范详见同目录《YOLO数据集目录结构与配置规范.md》。
+> 以下是历史 RGB 项目的示例，需要按任务适配，不能仅改路径用于本项目五通道训练。
+
+## 本项目适用范围（2026-09-16）
+
+当前环境为 PyTorch 2.14.0+cu132，正式入口为 `uv run python main.py`，配方与成绩以 [训练配置与数据集复核](训练配置与数据集复核.md) 为准。v3 保留 1280、batch=5、workers=4、BF16、disk 缓存；5000 轮仅作上限，学习率在 200 轮衰减，第 101 轮关闭 Mosaic。
+
+本赛题不采用下文的外部采集、云端标注和验证集预标注回流示例；测试集不参与训练。五通道推理/验证必须配套三模态预处理，通用 RGB 的 `model.val/predict` 示例不能直接用于当前权重。图标同名只证明文件配对，不能证明标签语义或框位置正确；具体标注瑕疵和验证分布见 [数据核验记录](数据集成分与划分记录.md)。
 
 ## 0. 全流程地图
 
@@ -56,7 +62,7 @@ def generate_txt_for_cvat(target_dir, output_filename):
 
 ### 1.3 images/labels 配对清洗（训练前必做）
 
-按"文件名（去后缀）"配对，只保留**既有图又有标注**的样本，能揪出所有脏数据：
+按文件名词干检查图片与标注是否成对，只能发现缺图、缺标注等结构问题。框位置、类别语义、漏标、同场景泄漏需要进一步核验；不要未经检查就删除不配对样本。
 
 ```python
 import os, shutil
@@ -217,11 +223,11 @@ if __name__ == '__main__':   # Windows 必加！否则 DataLoader 多进程递�
     model = YOLO(r"yolo26n.pt")            # 永远从官方预训练权重起步，别从零训
     model.train(
         data=r"./my_dataset/my_dataset.yaml",
-        epochs=10000,        # 轮数给足，配合 patience 早停兜底
+        epochs=10000,        # 历史示例上限；学习率与关闭 Mosaic 的日程需单独核对
         imgsz=640,
         patience=100,        # 验证指标 100 轮无改善 → 早停（默认即 100）
         batch=78,            # 按显存往上试到 OOM 回退一格
-        save_period=100,     # 每 100 轮存检查点（-1 = 只存 last.pt）
+        save_period=100,     # 每 100 轮另存检查点；-1 关闭周期留档，仍可保存 best/last
         plots=True,          # 生成 results.png / train_batch*.jpg，复盘必备
         val=True,
         cache=False,         # True=缓存进内存，"disk"=缓存到磁盘；省 IO 换内存
@@ -239,7 +245,7 @@ model.train(resume=True, data=r"./my_dataset/my_dataset.yaml",
             epochs=10000, imgsz=640)                       # ② resume=True，其余参数照旧
 ```
 
-> 实测：训练中途 Ctrl+C 强退（Windows 退出码 `0xC000013A` 属正常）后，resume 从中断 epoch 无缝续上（火灾项目从 epoch 125 续训）。所以 `save=True` 别关，它是续训的命根子。
+> 续训从最近成功保存的轮次恢复，不恢复中断轮中尚未保存的批次；同时恢复检查点训练参数和优化器。更换配方应新开运行，不能假设传入的所有参数都会覆盖 resume 配置。本项目使用 `main.py` 的 RESUME_PATH 分支。
 
 ### 3.3 导出
 
@@ -253,8 +259,8 @@ model.export(format="engine")   # TensorRT；也支持 onnx / openvino / tflite 
 - **速度参考**：n 模型 640 分辨率、batch=78 时约 966 batch/epoch ≈ 4 分钟，验证 3915 张 ≈ 29 秒。换算自己的数据量估算时长。
 - **cache**：内存富余 `cache=True` 最快；不够用 `cache="disk"` 也比每次读盘强；数据在机械盘就别开。
 - **workers**：Windows 下 2~6 都行，太大会卡在进程创建。
-- **优化器**：YOLO26 默认 `MuSGD(lr=0.01, momentum=0.9)`，一般不用动。
-- **增强**：默认开 `auto_augment=randaugment`，小数据集保持默认即可提升泛化。
+- **优化器**：当前安装版本的 auto 会按训练迭代数选择 AdamW 或 MuSGD；项目显式设置 AdamW，不由 auto 决定。
+- **增强**：auto_augment=randaugment 用于分类，不会增强本项目 detect。五通道几何增强必须同步，不能直接对五通道使用 RGB HSV。
 
 ## 4. 推理与复盘
 
@@ -288,7 +294,7 @@ from ultralytics import YOLO
 
 df = pd.read_csv(r"runs/detect/train/results.csv")
 df.columns = df.columns.str.strip()           # 去掉列名空格
-# best.pt 默认按综合 fitness 选，不一定 mAP50-95 最高；手动找真正的最优轮次
+# 本项目安装版本的检测 fitness 使用 mAP50-95；按 CSV 核对最佳轮次
 best = df.loc[df["metrics/mAP50-95(B)"].idxmax()]
 print(f"最佳 epoch: {int(best['epoch'])}  mAP50={best['metrics/mAP50(B)']:.4f}  "
       f"mAP50-95={best['metrics/mAP50-95(B)']:.4f}")
