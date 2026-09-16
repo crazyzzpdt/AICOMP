@@ -19,6 +19,7 @@ from ultralytics.data.utils import get_hash
 from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import LOGGER, RANK
+from ultralytics.utils.loss import E2ELoss
 from ultralytics.utils.torch_utils import unwrap_model
 
 
@@ -145,6 +146,18 @@ def fuse_modalities(visible_path: Path, infrared_path: Path, depth_path: Path) -
 
 
 # 二、Ultralytics 五通道数据集
+def resolve_modality_directory(data: dict[str, object], modality: str, img_path: str) -> Path:
+    """解析各拆分的本地模态目录，同时兼容历史共享目录配置。"""
+    root = Path(str(data.get("path", Path.cwd()))).resolve()
+    configured = data[modality]
+    if isinstance(configured, dict):
+        split = Path(img_path).resolve().parent.name
+        if split not in configured:
+            raise ValueError(f"模态 {modality} 没有拆分 {split} 的路径")
+        configured = configured[split]
+    return (root / str(configured)).resolve()
+
+
 class MultimodalYOLODataset(YOLODataset):
     """读取同名 RGB、红外、深度图并交给 Ultralytics 检测增强流程。"""
 
@@ -162,11 +175,9 @@ class MultimodalYOLODataset(YOLODataset):
         """
         if data.get("channels") != 5:
             raise ValueError("三模态早期融合训练的数据集 channels 必须为 5")
-        data_root = Path(str(data.get("path", Path.cwd()))).resolve()
-        infrared_dir = Path(str(data["infrared"]))
-        depth_dir = Path(str(data["depth"]))
-        self.infrared_dir = (data_root / infrared_dir).resolve() if not infrared_dir.is_absolute() else infrared_dir
-        self.depth_dir = (data_root / depth_dir).resolve() if not depth_dir.is_absolute() else depth_dir
+        img_path = str(kwargs.get("img_path", args[0] if args else ""))
+        self.infrared_dir = resolve_modality_directory(data, "infrared", img_path)
+        self.depth_dir = resolve_modality_directory(data, "depth", img_path)
         if not self.infrared_dir.is_dir() or not self.depth_dir.is_dir():
             raise FileNotFoundError("红外或深度图目录不存在，请检查 datasets/data.yaml")
         super().__init__(*args, data=data, **kwargs)
@@ -279,8 +290,43 @@ def learning_rate_factor(epoch: int, decay_epochs: int, final_ratio: float, cosi
     return final_ratio + (1.0 - final_ratio) * remaining
 
 
+def configure_loss_schedule(model: DetectionModel, decay_epochs: int, completed_epochs: int) -> None:
+    """独立设置双头损失进度，不改模型训练上限和其他损失超参数。
+
+    Args:
+        model: 已设置 args 和类别权重的 YOLO26 模型。
+        decay_epochs: 从 0.8/0.2 过渡到 0.1/0.9 的独立轮数。
+        completed_epochs: 已完成的轮数，用于恢复正确进度。
+    """
+    if decay_epochs < 2 or completed_epochs < 0:
+        raise ValueError("损失日程至少两轮，已完成轮数不能为负")
+    criterion = getattr(model, "criterion", None) or model.init_criterion()
+    if not isinstance(criterion, E2ELoss):
+        raise ValueError("独立双头损失日程只适用于 YOLO26 E2ELoss")
+    criterion.one2one.hyp = copy(criterion.one2one.hyp)
+    criterion.one2one.hyp.epochs = decay_epochs
+    criterion.updates = completed_epochs
+    criterion.o2m = criterion.decay(completed_epochs)
+    criterion.o2o = criterion.total - criterion.o2m
+    model.criterion = criterion
+    model.loss_decay_epochs = decay_epochs
+
+
 class MultimodalDetectionTrainer(DetectionTrainer):
     """构建五通道数据集，并将 RGB 预训练首层迁移到三模态模型。"""
+
+    # 默认保留旧损失日程，独立实验由子类设为 300，避免同时改变学习率与损失比例。
+    loss_decay_epochs: int | None = None
+
+    def _setup_train(self) -> None:
+        """在框架完成初始化和断点恢复后应用独立损失日程。"""
+        super()._setup_train()
+        model = unwrap_model(self.model)
+        horizon = getattr(model, "loss_decay_epochs", self.loss_decay_epochs)
+        if horizon is not None:
+            configure_loss_schedule(model, horizon, self.start_epoch)
+            configure_loss_schedule(self.ema.ema, horizon, self.start_epoch)
+            LOGGER.info(f"双头损失独立日程：{horizon} 轮，已完成 {self.start_epoch} 轮；训练上限 {self.epochs} 轮")
 
     # 框架生命周期方法名必须与父类一致。
     def _setup_scheduler(self) -> None:
@@ -351,8 +397,11 @@ class MultimodalDetectionTrainer(DetectionTrainer):
         model = self.set_model_names_for_load(
             DetectionModel(cfg, nc=self.data["nc"], ch=5, verbose=verbose and RANK == -1)
         )
+        model.loss_decay_epochs = self.loss_decay_epochs
         if weights:
             source_model = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights
+            if getattr(self, "resume", False):
+                model.loss_decay_epochs = getattr(source_model, "loss_decay_epochs", None)
             # 仅复制模型外壳与名称表，复用权重；不改原检查点名称或比赛类别编号。
             load_source = copy(source_model)
             source_names: dict[int, str] = dict(source_model.names)
@@ -371,3 +420,9 @@ class MultimodalDetectionTrainer(DetectionTrainer):
             elif source_weights.shape != target_weights.shape:
                 raise ValueError("检查点首层与当前五通道模型不兼容")
         return model
+
+
+class ScheduledMultimodalDetectionTrainer(MultimodalDetectionTrainer):
+    """仅改变双检测头损失衰减周期，用于与相同学习率配方独立对照。"""
+
+    loss_decay_epochs: int = 300

@@ -1,8 +1,8 @@
 """在 RTX 5080 16 GB 上训练 YOLO26l RGB、红外、深度融合检测模型。
 
 保留「docs/Ultralytics训练参数参考.md」的 83 个参数，并显式设置验证阈值。
-训练直接使用 datasets/train、datasets/val 与 datasets/data.yaml，标签来自官方 new_labels_2000。
-5000 轮仅作上限；自定义训练器在前 200 轮完成学习率衰减，第 101 轮起关闭 Mosaic。
+训练直接使用 datasets/train、datasets/val 与 datasets/data.yaml，标签为可追溯清洗版本。
+学习率在前 200 轮完成衰减，第 101 轮起关闭 Mosaic；5000 轮仍影响默认双头损失日程。
 配置依据、数据划分局限和本机实测见「docs/训练配置与数据集复核.md」。
 在项目目录执行 uv run python main.py 开始训练。
 
@@ -28,7 +28,7 @@ from 三模态训练 import MultimodalDetectionTrainer
 
 # n/s 更适合速度优先；m 更省资源；x 计算量明显更大。
 MODEL_PATH: str = r"./orgin_models/yolo26l.pt"
-# 12 类三模态数据集配置，沿用既有 1744/256 划分，标签来自 new_labels_2000。
+# 12 类清洗版三模态配置，三种图像及独立标签均在 datasets 的既有 1744/256 划分内。
 DATA_PATH: str = r"./datasets/data.yaml"
 # 训练结果根目录
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
@@ -38,6 +38,10 @@ RESUME_PATH: str | None = None
 MAX_EPOCHS: int = 5000
 # 前 100 轮保留拼图增强，使早停前能够进入普通场景收敛阶段。
 MOSAIC_EPOCHS: int = 100
+# 先检验较低学习率是否保留稀有类迁移能力；不预设其精度一定优于 0.0003。
+INITIAL_LR: float = 0.0001
+# 清洗版数据与较低学习率使用独立运行名称，不覆盖旧权重。
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v4_clean_lr1e4"
 
 
 # Windows 创建 DataLoader 子进程时会重新导入当前脚本，因此训练代码必须放在入口保护内。
@@ -62,7 +66,7 @@ if __name__ == "__main__":
     model: YOLO = YOLO(str(MODEL_PATH), task="detect")
     # 训练函数
     model.train(
-        trainer=MultimodalDetectionTrainer,  # 用五通道数据加载器同步融合 RGB、红外、深度
+        trainer=MultimodalDetectionTrainer,  # 使用 RGB、红外、深度五通道加载器与独立学习率日程
         # 一、模型、数据与训练时长
         model=str(MODEL_PATH),  # 显式记录本次训练使用的本地权重；与上方加载路径保持一致
         data=str(DATA_PATH),  # 12 类检测数据集配置
@@ -71,9 +75,9 @@ if __name__ == "__main__":
         epochs=MAX_EPOCHS,  # 最大训练轮数；与下方关闭 Mosaic 的轮数使用同一个上限
         time=None,  # 最大训练小时数；设置后覆盖 epochs 限制
         patience=100,  # 验证指标连续 100 轮未改善时提前停止，最终使用 best.pt
-        batch=4,  # 用户已完成 179 轮训练，日志显存约 15 GiB，保留本机已验证的批次
+        batch=4,  # v3 完成 250 轮验证过的批次；资源配置保持稳定以便比较配方
         imgsz=1280,  # 32 的整数倍；相比 960，提高小目标在输入图中的有效像素数
-        fraction=1.0,  # 使用全部数据；也可指定比例、数量或各拆分的列表
+        fraction=1.0,  # 使用清洗后的全部 1744 张训练图，256 张验证图不参与训练
         single_cls=False,  # 不将所有类别合并为一个类别
         classes=None,  # None 使用全部类别，也可指定类别 ID 列表
 
@@ -95,14 +99,14 @@ if __name__ == "__main__":
         save=True,  # 保存训练检查点和最终权重
         save_period=25,  # 每 25 轮额外留档；best.pt/last.pt 按框架训练流程保存
         project=PROJECT_PATH,  # 训练结果根目录
-        name="AIC_RGBIRDepth_yolo26l_1280_v3",  # 独立记录日程修正与球类迁移，与 v2 的 0.37746 比较
+        name=RUN_NAME,  # 清洗版新配方单独保存，保留之前两次训练产物
         exist_ok=False,  # 同名目录已存在时自动递增运行目录名
         save_dir=None,  # 指定确切输出目录会覆盖 project/name，且不自动递增
         resume=False,  # 首次训练；续训在上方 RESUME_PATH 填写 last.pt，由独立分支恢复
 
         # 四、优化器、学习率与预热
         optimizer="AdamW",  # 针对 1744 张的小数据预训练微调试验；避免沿用旧 MuSGD 的高学习率配方
-        lr0=0.0003,  # 保守微调起点；精度收益须由相同验证集实测，不当作已验证最优值
+        lr0=INITIAL_LR,  # 从 v3 的 0.0003 降至 0.0001，减小小数据集微调时的参数更新幅度
         lrf=0.01,  # 最终学习率比例，最终学习率为 lr0 * lrf
         momentum=0.9,  # AdamW 的 beta1，与原动量数值一致
         weight_decay=0.0005,  # 权重衰减
@@ -110,7 +114,7 @@ if __name__ == "__main__":
         warmup_momentum=0.8,  # 预热阶段的初始动量
         warmup_bias_lr=0.0,  # 与本版本 auto 行为一致，避免预热初期偏置学习率过高
         cos_lr=True,  # 自定义训练器在前 200 轮余弦衰减，此后保持 lr0*lrf，独立于总轮数上限
-        nbs=16,  # batch=5 时预热后约累积 3 批，有效批次约 15；不改变用户已完成的配方
+        nbs=16,  # batch=4 时预热后约累积 4 批，有效批次约 16，保持 v3 的更新频率
 
         # 五、检测损失与可选知识蒸馏
         box=7.5,  # 边界框损失权重
