@@ -1,7 +1,11 @@
 train: train/images
 val: val/images
-infrared: ../数据集/训练集/AIC2026_Train_2000/infrared
-depth: ../数据集/训练集/AIC2026_Train_2000/depth
+infrared:
+  train: train/infrared
+  val: val/infrared
+depth:
+  train: train/depth
+  val: val/depth
 channels: 5
 names:
   0: person
