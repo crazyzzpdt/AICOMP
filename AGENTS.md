@@ -5,6 +5,7 @@
 ## 项目结构与模块组织
 
 - `main.py`：训练入口（唯一）。YOLO26l 三模态五通道（RGB 3 + 红外 1 + 深度 1）融合检测。
+- `predict.py`：离线三模态预测入口，生成 `predict/images`、`predict/labels`、`predict/比赛提交内容/submission.zip`，已有输出目录不覆盖。
 - `三模态训练.py`：自定义训练器 `MultimodalDetectionTrainer` 与五通道数据加载；由 `main.py` 导入，不可直接作为独立训练入口运行。
 - `准备三模态数据集.py`：保留既有 1744/256 图像划分，将 `datasets/train` 和 `datasets/val` 原地更新为新版标注；仅在需要重建时运行。
 - `tests/`：pytest 测试，按 `test_<模块>.py` 命名。
@@ -16,10 +17,12 @@
 
 - `uv sync`：根据 `pyproject.toml` 和 `uv.lock` 创建或更新环境。
 - `uv run python main.py`：开始训练（在项目根目录执行）。
+- `uv run python predict.py`：预测官方初赛测试集并打包；默认旧运行 best.pt，可用 `--weights` 和 `--output` 指定权重及新输出目录。
 - `uv run pytest tests/`：运行测试。
 - `uv run python 准备三模态数据集.py`：使用官方新版标注更新 `datasets/train`、`datasets/val` 和五通道配置。
 - 断点续训：把 `main.py` 顶部 `RESUME_PATH` 设为本次 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/last.pt` 后运行 `uv run python main.py`。仅恢复同配方运行；更换配方时保持 `None`，因为续训会恢复检查点参数。
-- 当前配方：AdamW、lr0=0.0003、nbs=16、batch=5；MAX_EPOCHS=5000，学习率在前 200 轮衰减，close_mosaic 由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算，第 101 轮起关闭。RGB 预训练补充 sports ball → ball 名称对应。训练/验证各 4 个加载进程、每进程预取 1 批、关闭锁页。
+- 当前配方：AdamW、lr0=0.0003、nbs=16、batch=4；MAX_EPOCHS=5000，学习率在前 200 轮衰减，close_mosaic 由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算，第 101 轮起关闭。RGB 预训练补充 sports ball → ball 名称对应。训练/验证各 4 个加载进程、每进程预取 1 批、关闭锁页。epochs 仍影响 YOLO26 双头损失日程，不能仅描述为早停上限。
+- 2026-09-17 复盘：v3 已完成，CSV 最佳 0.37290（150 轮），旧运行最佳 0.37746（79 轮）。降低学习率、调整损失日程与数据清洗均为待验证候选，尚未实施；详见 `docs/训练配置与数据集复核.md`。
 
 ## 代码风格与命名规范
 
