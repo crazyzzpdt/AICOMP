@@ -2,15 +2,15 @@
 
 > 下文目录示例以 YOLO TXT 标注任务为主；分类任务的目录组织不同。历史 fight_detector 示例不代表本项目数据。
 
-## 本项目实际目录（2026-09-16）
+## 本项目实际目录（v4 清洗版）
 
-当前配置为 `datasets/data.yaml`，训练目录仅 `datasets/train/{images,labels}` 和 `datasets/val/{images,labels}`。train/val 分别 1744/256 张，标签均为官方 `new_labels_2000` 独立副本；images 为官方 visible 硬链接，原地改写会影响原图。
+当前配置为 datasets/data.yaml，两个划分分别含 images、infrared、depth、labels。train/val 为 1744/256 组，标签是官方新版的独立清洗副本；三种图像硬链接官方源，原地改写会影响原图。
 
-配置附带 `channels: 5`，红外/深度路径为 `../数据集/训练集/AIC2026_Train_2000/infrared`、`../数据集/训练集/AIC2026_Train_2000/depth`，由自定义加载器相对数据根目录解析。无需嵌套 `multimodal_new_labels`，无需在 datasets 内复制另一套红外/深度图。
+配置附带 channels: 5；infrared 与 depth 按 train/val 分别指向 train/infrared、val/infrared、train/depth、val/depth，相对 datasets 根解析。没有嵌套 multimodal_new_labels，硬链接复用源文件无需额外完整图像副本。
 
-标签缓存位于各 split 下，五通道 NPY 缓存位于 images 内。仅 `datasets/data.yaml` 入库。日常训练不运行重建脚本；`准备三模态数据集.py` 会更新标签并清理图像缓存，不能在训练使用这些文件时运行。
+标签缓存位于各 split 下，五通道 NPY 缓存位于 images 内。仅 datasets/data.yaml 入库。准备脚本默认生成审阅包，--apply-review 才备份并落位；日常训练无需运行，训练时不能替换其使用的标签。
 
-文件来源与标注质量是不同检查：本项目 2000 个 TXT 与官方新版相同，仍存在少量边缘框、重复行及验证分布不足，详见 [数据集成分与划分记录](数据集成分与划分记录.md)。
+清洗修改 57 个标签文件，保留审计与原始版；现有副本不再全部逐字节等于官方新版。验证分布不足与未确定语义问题仍保留，见 [数据集成分与划分记录](数据集成分与划分记录.md)。
 
 ## 1. 标准目录结构
 

@@ -1,6 +1,8 @@
 # Ultralytics 训练参数参考
 
-2026-09-16 项目说明：下表保留抓取时的框架默认值，不是当前训练配置。当前 v3 的实际值见 `main.py` 与 [训练配置与数据集复核](训练配置与数据集复核.md)：YOLO26l、五通道、1280、batch=5、workers=4、AdamW、lr0=0.0003、nbs=16、MAX_EPOCHS=5000、patience=100。
+v5_full 当前覆盖：lr0=0.0001（骨干 0.2 倍）、cls_pw=0、mosaic=0.25、scale=0.2、translate=0.05、close_mosaic=4840、patience=200、nms=True、save_period=50；弱类采样、原尺寸同步裁剪与 RGB 独立增强属于训练优化.py 的项目实现，不是框架新增参数。第 161 轮同时关闭 Mosaic、目标裁剪、辅助模态缺失。完整配置见 [v5方案](v5训练方案与球类诊断.md)，下方 v4 说明为历史记录。
+
+项目说明：下表保留抓取时的框架默认值，不是当前训练配置。v4 的实际值见 main.py 与 [训练配置与数据集复核](训练配置与数据集复核.md)：YOLO26l、五通道、1280、batch=4、workers=4、AdamW、lr0=0.0001、nbs=16、MAX_EPOCHS=5000、patience=100；已使用清洗数据完成训练。
 
 项目自定义训练器在前 200 轮衰减学习率，不能按框架默认的总轮数推算；close_mosaic 是最后 N 轮关闭，入口由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算（默认 4900），第 101 轮关闭。sports ball → ball 是项目的预训练名称适配，并非新增 Ultralytics 参数。auto_augment、erasing 等分类参数对当前 detect 不生效。
 

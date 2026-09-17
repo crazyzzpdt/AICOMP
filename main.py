@@ -2,7 +2,10 @@
 
 保留「docs/Ultralytics训练参数参考.md」的 83 个参数，并显式设置验证阈值。
 训练直接使用 datasets/train、datasets/val 与 datasets/data.yaml，标签为可追溯清洗版本。
-学习率在前 200 轮完成衰减，第 101 轮起关闭 Mosaic；5000 轮仍影响默认双头损失日程。
+v5_full 使用受限弱类重采样、原尺寸同步目标裁剪、RGB 独立增强和骨干低学习率。
+学习率在前 200 轮完成衰减，第 161 轮起关闭 Mosaic、目标裁剪与辅助模态缺失。
+5000 轮仍影响双头损失日程；patience=200 为完整模态收尾留出训练机会。
+best.pt 按 mAP50-95 选取，另存 best_map50.pt、best_map5095.pt 与逐类 AP 记录。
 配置依据、数据划分局限和本机实测见「docs/训练配置与数据集复核.md」。
 在项目目录执行 uv run python main.py 开始训练。
 
@@ -23,10 +26,10 @@ os.environ["YOLO_AUTOINSTALL"] = "false"
 import torch
 from ultralytics import YOLO
 # 自己的模块
-from 三模态训练 import MultimodalDetectionTrainer
+from 训练优化 import OptimizedMultimodalTrainer
 
 
-# n/s 更适合速度优先；m 更省资源；x 计算量明显更大。
+# v4 已取得线上 55.6000 分，保留同一基底；从 COCO 重新迁移以恢复球类初始化。
 MODEL_PATH: str = r"./orgin_models/yolo26l.pt"
 # 12 类清洗版三模态配置，三种图像及独立标签均在 datasets 的既有 1744/256 划分内。
 DATA_PATH: str = r"./datasets/data.yaml"
@@ -36,12 +39,12 @@ PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
 RESUME_PATH: str | None = None
 # 保留用户设置的训练上限；调整此值时自动同步 Mosaic 的末段轮数。
 MAX_EPOCHS: int = 5000
-# 前 100 轮保留拼图增强，使早停前能够进入普通场景收敛阶段。
-MOSAIC_EPOCHS: int = 100
-# 先检验较低学习率是否保留稀有类迁移能力；不预设其精度一定优于 0.0003。
+# 弱类重采样增加每轮样本，采用较低拼图概率，并延后关闭以保持场景多样性。
+MOSAIC_EPOCHS: int = 160
+# 沿用 v4 学习率，训练器将预训练骨干降为 0.2 倍；首层与检测头正常学习。
 INITIAL_LR: float = 0.0001
-# 清洗版数据与较低学习率使用独立运行名称，不覆盖旧权重。
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v4_clean_lr1e4"
+# 原尺寸裁剪与收尾阶段单独命名，保留旧 v5 配方及 v4 正式成绩基线。
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v5_full"
 
 
 # Windows 创建 DataLoader 子进程时会重新导入当前脚本，因此训练代码必须放在入口保护内。
@@ -54,7 +57,7 @@ if __name__ == "__main__":
         raise FileNotFoundError("模型权重或三模态数据配置不存在，请检查路径")
     if RESUME_PATH:
         YOLO(RESUME_PATH).train(
-            trainer=MultimodalDetectionTrainer,
+            trainer=OptimizedMultimodalTrainer,
             resume=True,
             data=DATA_PATH,
             workers=4,
@@ -66,7 +69,7 @@ if __name__ == "__main__":
     model: YOLO = YOLO(str(MODEL_PATH), task="detect")
     # 训练函数
     model.train(
-        trainer=MultimodalDetectionTrainer,  # 使用 RGB、红外、深度五通道加载器与独立学习率日程
+        trainer=OptimizedMultimodalTrainer,  # 受限弱类采样、同步增强、分层学习率及双指标权重留存
         # 一、模型、数据与训练时长
         model=str(MODEL_PATH),  # 显式记录本次训练使用的本地权重；与上方加载路径保持一致
         data=str(DATA_PATH),  # 12 类检测数据集配置
@@ -74,7 +77,7 @@ if __name__ == "__main__":
         cls_remap=True,  # 按名称迁移类别输出参数；自定义训练器补充 sports ball 到 ball 的对应
         epochs=MAX_EPOCHS,  # 最大训练轮数；与下方关闭 Mosaic 的轮数使用同一个上限
         time=None,  # 最大训练小时数；设置后覆盖 epochs 限制
-        patience=100,  # 验证指标连续 100 轮未改善时提前停止，最终使用 best.pt
+        patience=200,  # 为第 161 轮后的完整模态收尾留出机会；仍按历史最佳保存，不保证末轮最好
         batch=4,  # v3 完成 250 轮验证过的批次；资源配置保持稳定以便比较配方
         imgsz=1280,  # 32 的整数倍；相比 960，提高小目标在输入图中的有效像素数
         fraction=1.0,  # 使用清洗后的全部 1744 张训练图，256 张验证图不参与训练
@@ -97,16 +100,16 @@ if __name__ == "__main__":
 
         # 三、结果保存与恢复
         save=True,  # 保存训练检查点和最终权重
-        save_period=25,  # 每 25 轮额外留档；best.pt/last.pt 按框架训练流程保存
+        save_period=50,  # 两种 AP 最佳权重逐轮留存；每 50 轮额外保存完整检查点以控制磁盘增长
         project=PROJECT_PATH,  # 训练结果根目录
-        name=RUN_NAME,  # 清洗版新配方单独保存，保留之前两次训练产物
+        name=RUN_NAME,  # v5 配方单独保存，保留前三次训练产物与线上基线
         exist_ok=False,  # 同名目录已存在时自动递增运行目录名
         save_dir=None,  # 指定确切输出目录会覆盖 project/name，且不自动递增
         resume=False,  # 首次训练；续训在上方 RESUME_PATH 填写 last.pt，由独立分支恢复
 
         # 四、优化器、学习率与预热
         optimizer="AdamW",  # 针对 1744 张的小数据预训练微调试验；避免沿用旧 MuSGD 的高学习率配方
-        lr0=INITIAL_LR,  # 从 v3 的 0.0003 降至 0.0001，减小小数据集微调时的参数更新幅度
+        lr0=INITIAL_LR,  # 首层/颈部/检测头 0.0001，预训练骨干 0.00002，减轻迁移特征遗忘
         lrf=0.01,  # 最终学习率比例，最终学习率为 lr0 * lrf
         momentum=0.9,  # AdamW 的 beta1，与原动量数值一致
         weight_decay=0.0005,  # 权重衰减
@@ -119,7 +122,7 @@ if __name__ == "__main__":
         # 五、检测损失与可选知识蒸馏
         box=7.5,  # 边界框损失权重
         cls=0.5,  # 分类损失权重
-        cls_pw=0.25,  # 按训练集频次做温和的四次方根逆频率加权，兼顾稀有类和常见类
+        cls_pw=0.0,  # v5 用受限采样提高弱类曝光；关闭同时放大该类负样本 BCE 的频次加权
         dfl=1.5,  # 框距离回归损失权重，YOLO26 无 DFL 检测头使用 L1 损失
         distill_model=None,  # 不使用教师模型；可填本地教师权重的路径字符串
         dis=6.0,  # 开启知识蒸馏后的蒸馏损失权重
@@ -129,26 +132,26 @@ if __name__ == "__main__":
         split="val",  # 使用独立验证集，不把官方测试集用于选权重
         conf=0.001,  # 保留低分候选用于计算完整 PR 曲线；不是展示图片时的置信度阈值
         iou=0.7,  # NMS 去重阈值，与 mAP50-95 的评测 IoU 阈值区间不是同一含义
-        nms=None,  # 验证、早停和权重选择使用带 NMS 的检测头；False 时优先使用可用的无 NMS 头
+        nms=True,  # 明确使用一对多头；v5 验证器的单标签 NMS 与现有 predict.py 对齐
         max_det=100,  # 对齐比赛每图最多 100 个预测框；当前官方训练标注最大为 66 个
         plots=True,  # 保存训练曲线、验证指标和预测示例图
 
         # 七、检测数据增强
         rect=False,  # 矩形批次最小填充；False 使用正方形输入
         multi_scale=0.0,  # 多尺度尺寸变化比例；0 关闭，例如 0.25 表示 0.75~1.25 倍
-        close_mosaic=max(MAX_EPOCHS - MOSAIC_EPOCHS, 0),  # 自动换算最后 N 轮；5000 轮对应 4900，第 101 轮关闭
-        hsv_h=0.0,  # 五通道图像不能安全套用 RGB HSV；关闭以保护红外和深度物理含义
+        close_mosaic=max(MAX_EPOCHS - MOSAIC_EPOCHS, 0),  # 第 161 轮同时关闭拼图、目标裁剪与模态缺失，轻度 RGB 增强继续
+        hsv_h=0.0,  # 框架整图 HSV 关闭；训练优化.py 仅对 RGB 三通道施加轻度 HSV
         hsv_s=0.0,  # 同上
         hsv_v=0.0,  # 同上
         degrees=0.0,  # 随机旋转角度范围 ±degrees
-        translate=0.1,  # 水平/垂直平移比例范围
-        scale=0.3,  # 缩放系数约 0.7~1.3，减轻小目标在强缩小时消失的问题
+        translate=0.05,  # 减少边缘小目标被平移裁掉，同时保留弱类上下文裁剪
+        scale=0.2,  # 缩放约 0.8~1.2；目标裁剪另行提供放大，降低小球被缩至无效尺寸的概率
         shear=0.0,  # 随机剪切角度
         perspective=0.0,  # 透视变换幅度，通常为 0~0.001
         flipud=0.0,  # 上下翻转概率
         fliplr=0.5,  # 左右翻转概率
         bgr=0.0,  # RGB/BGR 通道顺序翻转概率
-        mosaic=0.5,  # 前 100 轮一半样本用四图拼接，增加普通场景比例以减轻训练/验证分布差异
+        mosaic=0.25,  # 降低拼图比例以保护小目标，前 160 轮保留四图场景组合
         mixup=0.0,  # MixUp 图像混合概率
         cutmix=0.0,  # CutMix 局部区域混合概率
         augmentations=None,  # 自定义 Albumentations 变换对象列表，仅 Python API 支持

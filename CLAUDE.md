@@ -1,8 +1,12 @@
 # CLAUDE.md
 
+用户优先要求：不自动运行测试、评估、额外推理或训练，不新建测试脚本；只分析现有产物与必要差异。评估模型.py、tests/、runs/config_checks 已移入 runs/code_cleanup/ 可恢复备份。v5_full 已完成，见 docs/v5训练完成复盘.md；下方旧进度保留为历史，不能据此再次启动训练。
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## 项目概览
+
+最新实施状态：main.py 训练入口已切到 v5_full，辅助模块训练优化.py。线上 v4=55.6000、epoch50=53.2540，v4 保留为基线；v5 已实现弱类采样、原尺寸同步目标裁剪、RGB 增强、模态随机缺失、骨干 0.2 倍学习率、关闭 cls_pw、单标签验证对齐及双指标留存，尚未执行训练。当前 mosaic=0.25、scale=0.2、translate=0.05、patience=200，第 161 轮关闭 Mosaic/目标裁剪/模态缺失。预测新增 --multi-label 可选开关，默认关闭。目标 60 分以上，不承诺实际结果；细节以 docs/v5训练方案与球类诊断.md 为准。下方 v4 复盘属于历史状态。
 
 2026 第八届 AIC 全球校园 AI 算法精英大赛参赛项目：**面向城市场景的视觉多模态目标检测**（算法挑战赛道）。
 
@@ -10,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **当前进度**：三模态早期融合训练已实现——`main.py`（YOLO26l，RGB 3 + 红外 1 + 深度 1 共 5 通道输入）+ `三模态训练.py`（自定义训练器）+ `准备三模态数据集.py`（新版标注数据集构建）+ `tests/`。`predict.py` 提供离线五通道预测、带框图片、六列 TXT 和初赛 ZIP；详见 `docs/预测与赛事提交.md`，已有输出目录不覆盖。
 
-2026-09-17 复盘：旧目录内 v2-3 运行最佳本地 mAP50-95=0.37746（第 79 轮），第 179 轮早停；v3 已完成，最佳 0.37290（第 150 轮），第 250 轮早停，没有超过旧运行。当前代码为 l/1280/batch=4、workers=4、AdamW、lr0=0.0003、nbs=16；MAX_EPOCHS=5000，学习率前 200 轮衰减，第 101 轮关闭 Mosaic。RGB 源 sports ball → ball 对应有效，但两次最终球类 AP 都为 0，早期权重覆盖诊断提示长训后迁移能力退化。epochs 仍影响 YOLO26 双头损失日程，不能仅描述为上限。lr0=0.0001、损失日程调整和定向数据清洗均是待验证候选，本次只更新文档，不改代码或数据。详见 `docs/训练配置与数据集复核.md`。
+最新复盘：v4_clean_lr1e4 已完成 200 轮，CSV 最高 mAP50=0.60632（42 轮）、mAP50-95=0.40370（100 轮），高于旧运行与 v3 的记录。当前配方 l/1280/batch=4、workers=4、AdamW、lr0=0.0001、nbs=16；上限 5000，学习率前 200 轮衰减、第 101 轮关闭 Mosaic，epochs 仍影响双头损失日程。已实施定向清洗并保留完整审计。predict.py 默认 v4 best.pt，mAP50 候选 epoch50.pt 实际为第 51 轮（0.59183）；第 42 轮未留存。当前先使用现有单个权重，不立即重训。弱类采样、多标签后处理、双指标留存和不同预训练基底尚未启用。详见 `docs/训练配置与数据集复核.md`。
 
 ## 常用命令
 
@@ -19,13 +23,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv run python main.py
 
 # 断点续训：把 main.py 顶部 RESUME_PATH 设为
-# runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/last.pt 后运行；仅恢复同配方运行
+# 同配方中断运行的实际 weights/last.pt；完成后剥离优化器的权重不能原状态恢复
 uv run python main.py
 
-# 测试
-uv run pytest tests/
-
-# 按既有划分重建 train/val，并使用官方新版标注
+# 默认生成清洗审阅包；落位需指定已确认记录的 --apply-review
 uv run python 准备三模态数据集.py
 ```
 
@@ -48,12 +49,12 @@ uv run python 准备三模态数据集.py
                                   #   png 845（1920×1080）+ jpg 155（640×360）
 
 datasets/                       # 落位后的训练数据（不入库，仅 data.yaml 入库）
-├── train/                       # 1744 张：images 与新版 labels
-├── val/                         # 256 张：images 与新版 labels
+├── train/                       # 1744 组：images、infrared、depth、labels
+├── val/                         # 256 组：images、infrared、depth、labels
 └── data.yaml                    # RGB / 红外 / 深度五通道配置
 ```
 
-数据已落位定稿：`datasets/{train,val}/{images,labels}` 与 `datasets/data.yaml` 直接对应，train 1744 / val 256（验证集约 12.8%）。图像是指向官方 visible 的硬链接，标注为官方 `new_labels_2000` 的独立副本；旧版标注仍保留在官方原始目录。划分按场景组原子切分，2026-09-15 已修正跨集同场景问题，详见 `docs/数据集成分与划分记录.md` 第 7 节。日常更新标注只需运行 `准备三模态数据集.py`；该脚本不建立第二套数据目录。
+数据已落位：datasets/{train,val}/{images,infrared,depth,labels}，1744/256 划分保留；图像硬链接官方源，标签为新版独立清洗副本。57 个标签文件变化，train 12628 框、val 2566 框；审计与备份在 runs/dataset_cleaning/20260917_012026。日常训练无需运行准备脚本，其默认命令只生成审阅包；历史重建函数不能覆盖清洗标签。划分依据与剩余局限见 docs/数据集成分与划分记录.md。
 
 - 12 类：0=person, 1=boat, 2=animal, 3=seat, 4=sign, 5=bicycle, 6=car, 7=ball, 8=light, 9=garbage can, 10=uav, 11=tricycle。**索引一经训练即固定，禁止调换或增删**。
 - 深度 png 必须按原始 16-bit 位深读取（`I;16`），不能当 8-bit 灰度图；但 `depth/` 里另有 149 张 jpg 是 **8-bit RGB**（640×360），不含 16-bit 数据，读深度要按扩展名分支。
@@ -89,7 +90,7 @@ datasets/                       # 落位后的训练数据（不入库，仅 dat
 
 - `.gitignore` 已显式排除数据集目录（`数据集/`、`datasets/`）、训练输出（`runs/`）、`*.cache` 及图片/txt/权重等——仓库只跟踪代码和文档，**严禁 git add 数据集或大文件**（GitHub 单文件上限 100MB；历史上曾因暂存数据集使 .git 膨胀到 17GB，2026-09-04 已清理重写）。唯一例外：`datasets/data.yaml`（12 类配置，训练必需）。
 - `docs/比赛资料/视频讲解.mp4`、`docs/比赛资料/参赛选手承诺书.pdf` 仅存于磁盘，不入库。
-- 当前 v3 训练输出在 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/`（重名自动递增）；旧目录保存历史运行。
+- 当前完成运行在 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v4_clean_lr1e4/`；旧目录与 v3 保留历史运行。
 - 远程仓库：`origin = github.com/crazyzzpdt/AICOMP`（主分支 `main`，普通 push 即可，勿用 force）。
 - 团队文档与提交信息使用中文，新增文档、注释请保持中文。
 

@@ -8,6 +8,8 @@
     uv run python predict.py
 更换权重或输出位置：
     uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/best.pt --output predict_v3
+可选保留单模型的次高类别候选（可能增加误检，不保证提分）：
+    uv run python predict.py --weights <本地权重路径> --multi-label --output predict_multilabel
 查看全部参数：
     uv run python predict.py --help
 """
@@ -18,6 +20,7 @@ import hashlib
 import json
 import os
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -33,7 +36,7 @@ import ultralytics
 from ultralytics import YOLO
 from ultralytics.engine.results import Results
 from ultralytics.models.yolo.detect.predict import DetectionPredictor
-from ultralytics.utils import ops
+from ultralytics.utils import nms, ops
 
 # 自己的模块
 from 三模态训练 import fuse_modalities
@@ -43,7 +46,7 @@ from 准备三模态数据集 import CLASS_NAMES, IMAGE_SUFFIXES
 # 相对命令行路径统一以脚本所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 # 选择推理的模型
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/best.pt"
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v5_full/weights/best.pt"
 # 官方初赛测试集；三种模态必须位于该目录的同名子文件夹。
 SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
 # 预测结果与训练 runs 隔离，重复运行须指定新的输出目录。
@@ -60,6 +63,8 @@ IOU_THRESHOLD: float = 0.7
 VISUAL_CONF: float = 0.25
 # 赛事规定单图最多 100 个框，超限按置信度截断。
 MAX_DETECTIONS: int = 100
+# 保持已有提交行为；需要保留同一位置的多个类别候选时显式使用 --multi-label。
+MULTI_LABEL: bool = False
 
 
 # 一、输入配对与模型检查
@@ -117,6 +122,11 @@ def validate_model(model: YOLO) -> None:
 class MultimodalDetectionPredictor(DetectionPredictor):
     """保留五通道输入，仅在构建结果图片时将前三通道恢复为 BGR。"""
 
+    def __init__(self, *args: object, multi_label: bool = False, **kwargs: object) -> None:
+        """将候选筛选开关保存在预测器中，不传入框架不支持的配置参数。"""
+        super().__init__(*args, **kwargs)
+        self.multi_label: bool = multi_label
+
     def preprocess(self, images: list[np.ndarray]) -> torch.Tensor:
         """检查 RGB、红外、深度顺序的 uint8 输入，再统一缩放和归一化。"""
         for image in images:
@@ -125,6 +135,25 @@ class MultimodalDetectionPredictor(DetectionPredictor):
         # 当前框架仅翻转三通道 BGR；五通道保持 fuse_modalities 的 RGBIRDepth 顺序。
         return super().preprocess(images)
 
+    def postprocess(self, preds: torch.Tensor, img: torch.Tensor, orig_imgs: list[np.ndarray], **kwargs: object) -> list[Results]:
+        """可选保留同框多类别候选，再按类别 NMS；仍仅使用一个模型。
+
+        Note:
+            默认沿用框架单标签路径。多标签只保留模型已给出的分数，不人为抬高
+            ball 置信度；低分候选可能争用每图 100 框的名额，效果需实际提交确认。
+        """
+        if not self.multi_label:
+            return super().postprocess(preds, img, orig_imgs, **kwargs)
+        if not isinstance(orig_imgs, list) or getattr(self.model, "end2end", False):
+            raise ValueError("多标签候选要求五通道 NumPy 图像和 nms=True 的一对多检测头")
+        rows = nms.non_max_suppression(
+            preds, self.args.conf, self.args.iou, classes=self.args.classes,
+            agnostic=self.args.agnostic_nms, multi_label=True, max_det=self.args.max_det,
+            nc=len(self.model.names), end2end=False, rotated=False,
+            max_time_img=2.0,  # 多类别低分候选较多，适度放宽后处理时间预算
+        )
+        return self.construct_results(rows, img, orig_imgs)
+
     def construct_result(self, pred: torch.Tensor, img: torch.Tensor, orig_img: np.ndarray, img_path: str) -> Results:
         """去掉 LetterBox 缩放和填充，返回原图坐标及可绘制的三通道图片。"""
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
@@ -132,7 +161,8 @@ class MultimodalDetectionPredictor(DetectionPredictor):
         return Results(visible, path=img_path, names=self.model.names, boxes=pred[:, :6])
 
 
-def predict_image(model: YOLO, fused: np.ndarray, output: Path, device: str, imgsz: int, conf: float, iou: float) -> Results:
+def predict_image(model: YOLO, fused: np.ndarray, output: Path, device: str, imgsz: int, conf: float,
+                  iou: float, multi_label: bool = False) -> Results:
     """逐张预测融合图，不积累整套测试集或让框架自行保存额外目录。
 
     Args:
@@ -143,19 +173,24 @@ def predict_image(model: YOLO, fused: np.ndarray, output: Path, device: str, img
         imgsz: LetterBox 目标尺寸。
         conf: 提交候选的最低置信度。
         iou: NMS 去重阈值。
+        multi_label: 是否保留同一候选框超过阈值的多个类别，不进行多模型融合。
 
     Returns:
         包含原图坐标预测框与 BGR 可见光图的检测结果。
     """
+    if model.predictor is not None:
+        if not isinstance(model.predictor, MultimodalDetectionPredictor):
+            raise ValueError("当前模型已绑定其他预测器，请重新加载五通道权重")
+        model.predictor.multi_label = multi_label
     results: list[Results] = model.predict(
-        predictor=MultimodalDetectionPredictor,  # 五通道输入与 RGB 显示分离
+        predictor=partial(MultimodalDetectionPredictor, multi_label=multi_label),  # 开关由自定义预测器接收
         # 一、输入、检测与精度
         source=fused,  # 已同步融合的 RGB 3 + 红外 1 + 深度 1，不传单张 RGB 路径
         imgsz=imgsz,  # 默认 1280，与训练验证分辨率一致
         rect=True,  # 单图最小矩形填充，保持比例，减少无效像素
         conf=conf,  # 默认 0.001，为 AP 评测保留低分候选
         iou=iou,  # 默认 0.7，与训练验证的 NMS 一致
-        nms=True,  # 明确使用带 NMS 的一对多头，与训练 nms=None 的行为一致
+        nms=True,  # 明确使用带 NMS 的一对多头，与 v5 训练验证一致
         max_det=MAX_DETECTIONS,  # 官方单图最多 100 个框
         agnostic_nms=False,  # 不跨类别互相抑制，保留人与车等重叠目标
         classes=None,  # 预测全部 12 类
@@ -350,6 +385,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--imgsz", type=int, default=IMAGE_SIZE, help="推理尺寸，默认 1280，必须为 32 的正整数倍")
     parser.add_argument("--conf", type=float, default=CONF_THRESHOLD, help="提交候选阈值，默认 0.001")
     parser.add_argument("--iou", type=float, default=IOU_THRESHOLD, help="NMS 阈值，默认 0.7")
+    parser.add_argument("--multi-label", action=argparse.BooleanOptionalAction, default=MULTI_LABEL,
+                        help="保留同框多类别候选；默认关闭，可能改善召回也可能增加误检")
     parser.add_argument("--visual-conf", type=float, default=VISUAL_CONF, help="仅图片显示阈值，默认 0.25")
     parser.add_argument("--expected-count", type=int, default=EXPECTED_COUNT, help="预期测试图数量，初赛为 1000")
     args = parser.parse_args(argv)
@@ -375,7 +412,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"预测权重：{weights}\n三模态配对完成，共 {len(samples)} 组；结果写入 {output}")
     for index, (visible, infrared, depth) in enumerate(samples, start=1):
         fused = fuse_modalities(visible, infrared, depth)
-        result = predict_image(model, fused, output, args.device, args.imgsz, args.conf, args.iou)
+        result = predict_image(model, fused, output, args.device, args.imgsz, args.conf, args.iou, args.multi_label)
         save_prediction(result, visible.name, output, args.visual_conf)
         if index == 1 or index % 25 == 0 or index == len(samples):
             print(f"预测完成 {index}/{len(samples)}：{visible.name}")
@@ -384,7 +421,7 @@ def main(argv: list[str] | None = None) -> None:
         "run": weights.parent.parent.name, "weights_sha256": weight_hash, "source": source.name,
         "images": len(samples), "classes": list(CLASS_NAMES), "ultralytics": ultralytics.__version__,
         "torch": torch.__version__, "imgsz": args.imgsz, "conf": args.conf, "iou": args.iou,
-        "visual_conf": args.visual_conf, "nms": True, "max_det": MAX_DETECTIONS,
+        "visual_conf": args.visual_conf, "nms": True, "multi_label": args.multi_label, "max_det": MAX_DETECTIONS,
         "quantize": 32, "rect": True, "device": args.device, "batch": 1, "augment": False,
     }
     with (output / "prediction.json").open("x", encoding="utf-8") as handle:

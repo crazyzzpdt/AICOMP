@@ -1,14 +1,22 @@
 # 仓库协作规范
 
+## 当前优先约束
+
+用户明确要求控制工具调用与 token：不自动运行 pytest、冒烟测试、模型评估、额外推理或训练；不为调用技能新建测试与评估脚本。只读取已有训练产物，必要时检查引用和实际差异。只有用户明确要求才执行测试或评估，提交前也不自动测试；必须如实说明未测试，不宣称已验证运行正确性。
+
+v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0.59835（41 轮）；后期过拟合，不能描述为全面胜过 v4。ball 最终 best.pt AP50=0.423。详见 docs/v5训练完成复盘.md。下方训练设置是已完成配方，不代表新的重训授权。
+
+最新实施状态：main.py 已改为 v5_full，由训练优化.py 的 OptimizedMultimodalTrainer 提供弱类受限重采样、原尺寸同步裁剪、RGB 增强、模态随机缺失与骨干 0.2 倍学习率。主学习率 0.0001、cls_pw=0、mosaic=0.25、scale=0.2、translate=0.05、patience=200，第 161 轮关闭 Mosaic/目标裁剪/模态缺失；额外保存两种 AP 最佳权重与逐类指标。predict.py 新增可选 --multi-label，默认关闭且保留用户权重路径。线上 v4=55.6000、epoch50=53.2540，保留 v4 为正式基线。目标 60 分以上，不保证提分；v5 仅静态检查，用户自行开训。详见 docs/v5训练方案与球类诊断.md，后面 v4 复盘保留为历史。
+
 代码与注释风格以仓库内 `main.py` 为基准（2026-09-15 定）：新写或修改代码前先通读 `main.py`、`三模态训练.py` 与 `准备三模态数据集.py`，模仿既有写法。
 
 ## 项目结构与模块组织
 
-- `main.py`：训练入口（唯一）。YOLO26l 三模态五通道（RGB 3 + 红外 1 + 深度 1）融合检测。
+- `main.py`：训练入口（唯一）。YOLO26l 三模态五通道（RGB 3 + 红外 1 + 深度 1）融合检测；v5 优化组件在训练优化.py。
 - `predict.py`：离线三模态预测入口，生成 `predict/images`、`predict/labels`、`predict/比赛提交内容/submission.zip`，已有输出目录不覆盖。
 - `三模态训练.py`：自定义训练器 `MultimodalDetectionTrainer` 与五通道数据加载；由 `main.py` 导入，不可直接作为独立训练入口运行。
 - `准备三模态数据集.py`：保留既有 1744/256 图像划分，将 `datasets/train` 和 `datasets/val` 原地更新为新版标注；仅在需要重建时运行。
-- `tests/`：pytest 测试，按 `test_<模块>.py` 命名。
+- 评估模型.py、tests/ 与 runs/config_checks 已从工作位置移入 runs/code_cleanup/ 的可恢复备份；不是训练或预测依赖。
 - `datasets/`：仅包含 `train/`、`val/` 与必需的 `data.yaml`；仅 `datasets/data.yaml` 入库。
 - `数据集/`（官方原始数据）与 `runs/`（训练产物）不入库；`orgin_models/` 存放本地权重（不入库）。
 - `docs/`：资料、复盘与经验文档；官方赛题资料在 `docs/比赛资料/`。
@@ -17,12 +25,11 @@
 
 - `uv sync`：根据 `pyproject.toml` 和 `uv.lock` 创建或更新环境。
 - `uv run python main.py`：开始训练（在项目根目录执行）。
-- `uv run python predict.py`：预测官方初赛测试集并打包；默认旧运行 best.pt，可用 `--weights` 和 `--output` 指定权重及新输出目录。
-- `uv run pytest tests/`：运行测试。
+- `uv run python predict.py`：预测官方初赛测试集并打包；当前默认 v4_clean_lr1e4 的 best.pt，mAP50 优先候选为同目录 epoch50.pt（实际第 51 轮），用 --weights 与 --output 显式指定。
 - `uv run python 准备三模态数据集.py`：使用官方新版标注更新 `datasets/train`、`datasets/val` 和五通道配置。
-- 断点续训：把 `main.py` 顶部 `RESUME_PATH` 设为本次 `runs/detect/AIC_RGBIRDepth_yolo26l_1280_v3/weights/last.pt` 后运行 `uv run python main.py`。仅恢复同配方运行；更换配方时保持 `None`，因为续训会恢复检查点参数。
-- 当前配方：AdamW、lr0=0.0003、nbs=16、batch=4；MAX_EPOCHS=5000，学习率在前 200 轮衰减，close_mosaic 由 MAX_EPOCHS-MOSAIC_EPOCHS 自动换算，第 101 轮起关闭。RGB 预训练补充 sports ball → ball 名称对应。训练/验证各 4 个加载进程、每进程预取 1 批、关闭锁页。epochs 仍影响 YOLO26 双头损失日程，不能仅描述为早停上限。
-- 2026-09-17 复盘：v3 已完成，CSV 最佳 0.37290（150 轮），旧运行最佳 0.37746（79 轮）。降低学习率、调整损失日程与数据清洗均为待验证候选，尚未实施；详见 `docs/训练配置与数据集复核.md`。
+- 断点续训：RESUME_PATH 仅填写同配方中断运行的实际 last.pt；已完成并剥离优化器的检查点不作为原状态续训入口。更换配方保持 None。
+- 已完成 v5 配方：AdamW、lr0=0.0001（骨干 0.2 倍）、nbs=16、batch=4、patience=200；MAX_EPOCHS=5000，学习率前 200 轮衰减，第 161 轮关闭 Mosaic/目标裁剪/模态缺失。训练/验证各 4 个加载进程、预取 1 批、关闭锁页；epochs 仍影响双头损失日程。
+- 初始化澄清：v5 从 orgin_models/yolo26l.pt 官方 COCO 预训练重新迁移，resume=false，未续训 v4；重新初始化不保证消除过拟合。弱类采样、双指标留存已启用，多标签预测为默认关闭的可选开关，不同基底未启用。不自动重训，详见 docs/v5训练完成复盘.md。
 
 ## 代码风格与命名规范
 
@@ -70,11 +77,9 @@ def read_image(path: Path, flags: int) -> np.ndarray:
 
 日志必须具体描述对象和结果，如 `训练数据复制完成，共 N 张`，避免只写 `成功`、`失败`。
 
-## 测试规范
+## 检查边界
 
-- 测试使用 pytest，放在 `tests/`，按 `test_<模块>.py` 命名；`pytest` 已列入 dev 依赖组。
-- 数据与模型相关测试不依赖真实训练运行，覆盖数据配对、加载器输出、类别映射等。
-- 提交前运行 `uv run pytest tests/`。
+不自动进行测试或额外模型评估，遵守上方当前优先约束。框架正式训练内部的 val=True 用于选权重和早停，与额外 pytest、独立复评不同，不因清理 tests 而关闭。
 
 ## 提交与 Pull Request 规范
 
