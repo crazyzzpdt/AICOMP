@@ -30,8 +30,8 @@ from 三模态预测 import PredictionConfig, predict
 
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-# 使用用户选择的 v7 权重，预测 imgsz 与该运行的 1536 训练尺寸一致。
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_dfine_l_1536_v7/weights/best_map50.pth"
+# 使用用户选择的 v8 AP50 最佳权重，预测尺寸与该运行的 1280 一致。
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_dfine_l_1280_v8/weights/best_map50.pth"
 # 官方初赛的同名 visible、infrared、depth 三模态图像。
 SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。
@@ -49,7 +49,7 @@ if __name__ == "__main__":
         expected_count=1000,  # 已确认初赛为 1000 组，仅核对文件清单避免交错目录
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
-        imgsz=1536,  # 与当前 v7 权重的训练、验证尺寸一致；换权重时须同步核对尺寸
+        imgsz=1280,  # 与当前 v8 权重的训练、验证尺寸一致；换权重时须同步核对尺寸
         batch=18,  # 保留用户设置的物理批次，资源占用由用户按正式运行情况调整
         workers=8,  # 并行解码三模态并提前缩放，给 GPU 连续准备输入
         save_workers=8,  # 后台画框、编码和写文件，不再逐张阻塞下一次推理

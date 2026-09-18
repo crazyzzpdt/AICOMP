@@ -34,8 +34,8 @@ from D细化训练 import TrainingConfig, train
 MODEL_PATH: str = "./orgin_models/dfine_l_obj365_e25.pth"
 # v8 清洗数据统一落在 datasets；划分与标签须匹配下方审计记录。
 DATA_PATH: str = "./datasets/data.yaml"
-# 清洗与分组审阅的落位记录；训练入口只校验，不自动清洗或移动数据。
-DATA_AUDIT: str = "./runs/dataset_cleaning/v8_20260918_162439/manifest.json"
+# 重新下载来源的落位审计；保留既有划分，训练入口只校验不自动移动数据。
+DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 新架构单独存放，已有同名结果自动使用时间戳目录。
 PROJECT_PATH: str = "./runs/detect"
 # 沿用 v6 的 60 轮余弦周期；连续 10 轮无有效提升时提前结束，不强行跑满。

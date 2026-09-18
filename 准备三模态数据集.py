@@ -3,6 +3,7 @@
 默认仅生成审阅记录；确认后用 --apply-review 指定记录目录进行备份和落位。
 v8 使用 --audit-v8 导出来源审计，--review-v8 导出弱类审阅图；
 仅在 split_plan.json 已审阅后用 --apply-v8 落位，并完整备份旧划分。
+重新官方下载后使用 --refresh-official，保留现有划分，比较全部来源并重建副本。
 正式训练由 main.py 启动，原始数据不修改。
 """
 
@@ -530,9 +531,137 @@ def apply_v8(dataset: Path, raw: Path, official_labels: Path, report: Path) -> N
     print(f"v8 清洗数据已落位 datasets：{counts}；旧划分和缓存完整保留：{backup}")
 
 
+def refresh_official_dataset(dataset: Path, raw: Path, official_labels: Path) -> Path:
+    """按现有划分重建最新官方下载副本，完整备份旧数据和缓存。
+
+    Args:
+        dataset: 项目 datasets 目录。
+        raw: 重新下载的官方三模态目录。
+        official_labels: 官方 new_labels_2000 标签目录，绝不读取旧 labels。
+
+    Returns:
+        本轮审计目录，包含来源对比、标签修改记录及完整旧数据。
+
+    Note:
+        不改变 train/val 划分；旧人工改类仅在图像指纹和源标签原行均匹配时沿用。
+        新来源不匹配时保留官方类别并记入待审阅，不自动延用旧语义判断。
+    """
+    from PIL import Image
+
+    root = Path(__file__).resolve().parent
+    dataset = dataset.resolve()
+    if dataset != root / "datasets":
+        raise ValueError("官方刷新仅允许项目 datasets 目录")
+    assignments = {path.name: split for split in ("train", "val") for path in _image_files(dataset / split / "images")}
+    if len(assignments) != 2000 or sum(len(_image_files(dataset / split / "images")) for split in ("train", "val")) != 2000:
+        raise ValueError("现有划分必须完整包含 2000 张不重复图像")
+    for modality in ("visible", "infrared", "depth"):
+        if {path.name for path in _image_files(raw / modality)} != set(assignments):
+            raise ValueError(f"重新下载的 {modality} 清单与现有划分不一致，禁止静默丢图或错配")
+    if {path.stem for path in official_labels.glob("*.txt")} != {Path(name).stem for name in assignments}:
+        raise ValueError("new_labels_2000 与全部训练图像词干不一一对应")
+    prior_path = root / "runs/dataset_cleaning/v8_20260918_162439/proposed.json"
+    prior = {row["image"]: row for row in json.loads(prior_path.read_text(encoding="utf-8"))} if prior_path.is_file() else {}
+    report = root / "runs/dataset_cleaning" / f"official_refresh_{datetime.now():%Y%m%d_%H%M%S}"
+    report.mkdir(parents=True, exist_ok=False)
+    staging, backup = report / "staging", report / "before"
+    staging.mkdir()
+    backup.mkdir()
+    shutil.copy2(dataset / "data.yaml", backup / "data.yaml")
+    changed_sources: Counter[str] = Counter()
+    pending: list[str] = []
+    records: list[dict[str, object]] = []
+    counts: dict[str, object] = {}
+    for split in ("train", "val"):
+        for child in ("images", "infrared", "depth", "labels"):
+            (staging / split / child).mkdir(parents=True)
+        boxes: Counter[int] = Counter()
+        members = sorted(name for name, owner in assignments.items() if owner == split)
+        for name in members:
+            sizes: list[tuple[int, int]] = []
+            source_hashes: dict[str, str] = {}
+            old_hashes: dict[str, str | None] = {}
+            for child, modality in (("images", "visible"), ("infrared", "infrared"), ("depth", "depth")):
+                source, old = raw / modality / name, dataset / split / child / name
+                with Image.open(source) as opened:
+                    sizes.append(opened.size)
+                    opened.verify()
+                source_hashes[modality] = file_hash(source)
+                old_hashes[modality] = file_hash(old) if old.is_file() else None
+                changed_sources[modality] += old_hashes[modality] != source_hashes[modality]
+                _link_or_validate(source, staging / split / child / name)
+            if len(set(sizes)) != 1:
+                raise ValueError(f"新下载三模态尺寸不一致：{name}")
+            filename = Path(name).with_suffix(".txt").name
+            source_label, old_label = official_labels / filename, dataset / split / "labels" / filename
+            original = source_label.read_text(encoding="utf-8-sig")
+            corrected, manual = original, []
+            correction = REVIEWED_CLASS_CORRECTIONS.get(filename)
+            if correction:
+                number, expected, _, _ = correction
+                matching = (prior.get(name, {}).get("source_hashes", {}).get("visible") == source_hashes["visible"]
+                            and len(original.splitlines()) >= number and original.splitlines()[number - 1] == expected)
+                if matching:
+                    corrected, manual = correct_reviewed_classes(filename, original)
+                else:
+                    pending.append(filename)
+            cleaned, changes = clean_label_text(corrected)
+            destination = staging / split / "labels" / filename
+            destination.write_text(cleaned, encoding="utf-8")
+            old_text = old_label.read_text(encoding="utf-8-sig") if old_label.is_file() else None
+            changed_sources["cleaned_labels"] += old_text != cleaned
+            changed_sources["official_labels_vs_prior"] += prior.get(name, {}).get("official_label_sha256") != file_hash(source_label)
+            boxes.update(int(line.split()[0]) for line in cleaned.splitlines() if line.strip())
+            records.append({"image": name, "before_split": split, "after_split": split, "size": list(sizes[0]),
+                            "source_hashes": source_hashes, "before_source_hashes": old_hashes,
+                            "official_label_sha256": file_hash(source_label),
+                            "before_sha256": file_hash(old_label) if old_label.is_file() else None,
+                            "after_sha256": file_hash(destination), "changes": manual + changes})
+        counts[split] = {"images": len(members), "extensions": dict(Counter(Path(name).suffix.lower() for name in members)),
+                         "class_boxes": {name: boxes[index] for index, name in enumerate(CLASS_NAMES)}}
+    fingerprint_splits: dict[str, set[str]] = {}
+    for row in records:
+        fingerprint_splits.setdefault(row["source_hashes"]["visible"], set()).add(row["after_split"])
+    if any(len(splits) > 1 for splits in fingerprint_splits.values()):
+        raise ValueError("最新下载来源出现跨集完全重复图像，需先审阅而非直接覆盖")
+    manifest = {"status": "staged", "source": "official_redownload_new_labels_2000",
+                "label_source": "数据集/训练集/new_labels_2000", "counts": counts,
+                "changed_sources": dict(changed_sources), "pending_class_review": pending, "samples": records}
+    manifest_path = report / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    completed: list[str] = []
+    try:
+        for split in ("train", "val"):
+            source, saved, replacement = dataset / split, backup / split, staging / split
+            if source.resolve().parent != dataset or saved.resolve().parent != backup or replacement.resolve().parent != staging:
+                raise ValueError("目录解析超出预期位置，拒绝移动")
+            source.rename(saved)
+            try:
+                replacement.rename(source)
+            except BaseException:
+                saved.rename(source)
+                raise
+            completed.append(split)
+    except BaseException:
+        for split in reversed(completed):
+            (dataset / split).rename(staging / split)
+            (backup / split).rename(dataset / split)
+        raise
+    manifest["status"] = "applied"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary = {key: value for key, value in manifest.items() if key != "samples"}
+    summary["changed_label_files"] = sum(bool(row["changes"]) for row in records)
+    summary["actions"] = dict(Counter(change["action"] for row in records for change in row["changes"]))
+    summary["backup"] = "before"
+    (report / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"官方重新下载数据已落位：{report}；来源差异：{dict(changed_sources)}；待复核类别：{pending}")
+    return report
+
+
 def main() -> None:
     """先导出审阅包，再按指定审阅包执行可追溯清洗。"""
     parser = argparse.ArgumentParser(description="审阅并清洗三模态训练标签")
+    parser.add_argument("--refresh-official", action="store_true", help="从重新下载的三模态及 new_labels_2000 重建，完整备份当前副本")
     parser.add_argument("--apply-review", type=Path, help="已经逐图审阅的审计目录，必须包含 approved.json")
     parser.add_argument("--audit-v8", action="store_true", help="核验清洗数据并导出 JPG 场景审阅图，不运行模型")
     parser.add_argument("--apply-v8", type=Path, help="应用审阅目录中的 split_plan.json，整份旧划分搬入备份")
@@ -542,7 +671,9 @@ def main() -> None:
     dataset = project_root / "datasets"
     raw = project_root / "数据集" / "训练集" / "AIC2026_Train_2000"
     official_labels = project_root / "数据集" / "训练集" / "new_labels_2000"
-    if args.audit_v8:
+    if args.refresh_official:
+        refresh_official_dataset(dataset, raw, official_labels)
+    elif args.audit_v8:
         audit_v8(dataset, raw, official_labels)
     elif args.review_v8:
         review_v8_weak_classes(args.review_v8.resolve(), raw)
