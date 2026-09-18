@@ -31,7 +31,7 @@ from 三模态预测 import PredictionConfig, predict
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 # 使用用户选择的 v7 权重，预测 imgsz 与该运行的 1536 训练尺寸一致。
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_dfine_l_1536_v7/weights/best.pth"
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_dfine_l_1536_v7/weights/best_map50.pth"
 # 官方初赛的同名 visible、infrared、depth 三模态图像。
 SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。

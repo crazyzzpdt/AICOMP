@@ -1,5 +1,7 @@
 # Ultralytics 预测参数参考
 
+2026-09-18 项目适配：当前入口区分YOLO .pt与D-FINE .pth。YOLO默认yolo_profile=v4，逐张矩形填充、原生单标签NMS；current保留批量自定义候选。D-FINE使用五通道正方形等比填充和原生查询排序，iou/multi_label不是它的调参开关，必须匹配训练imgsz。visual_conf与输出压缩只影响展示和写盘，不改变检测输入或TXT候选；conf降低未必改变每图前100框。用法见 [预测文档](预测与赛事提交.md)。
+
 来源（2026-09-16 整理）：
 
 - [使用 Ultralytics YOLO 进行模型预测](https://docs.ultralytics.com/zh/modes/predict)

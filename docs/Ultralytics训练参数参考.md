@@ -1,5 +1,7 @@
 # Ultralytics 训练参数参考
 
+2026-09-18 适用说明：本文为Ultralytics默认参数与历史YOLO项目覆盖记录，不是当前main.py配置。D-FINE v8使用独立TrainingConfig、官方原生损失和optimizer_step日程，不能把YOLO的box/cls/dfl或Mosaic参数当成等价设置。当前值见 [v8方案](v8训练方案与数据清洗.md)，通用知识见 [知识索引](项目知识索引.md)。下方v4/v5“当前”均限于历史阶段。
+
 v5_full 当前覆盖：lr0=0.0001（骨干 0.2 倍）、cls_pw=0、mosaic=0.25、scale=0.2、translate=0.05、close_mosaic=4840、patience=200、nms=True、save_period=50；弱类采样、原尺寸同步裁剪与 RGB 独立增强属于训练优化.py 的项目实现，不是框架新增参数。第 161 轮同时关闭 Mosaic、目标裁剪、辅助模态缺失。完整配置见 [v5方案](v5训练方案与球类诊断.md)，下方 v4 说明为历史记录。
 
 项目说明：下表保留抓取时的框架默认值，不是当前训练配置。v4 的实际值见 main.py 与 [训练配置与数据集复核](训练配置与数据集复核.md)：YOLO26l、五通道、1280、batch=4、workers=4、AdamW、lr0=0.0001、nbs=16、MAX_EPOCHS=5000、patience=100；已使用清洗数据完成训练。
