@@ -1,11 +1,14 @@
-"""审阅并清洗官方新版标签，将三模态原位落到 datasets 的既有划分。
+"""审阅并清洗官方新版标签，将三模态按留痕计划落到 datasets。
 
 默认仅生成审阅记录；确认后用 --apply-review 指定记录目录进行备份和落位。
+v8 使用 --audit-v8 导出来源审计，--review-v8 导出弱类审阅图；
+仅在 split_plan.json 已审阅后用 --apply-v8 落位，并完整备份旧划分。
 正式训练由 main.py 启动，原始数据不修改。
 """
 
 # 内置库
 import argparse
+from collections import Counter
 from datetime import datetime
 import hashlib
 import json
@@ -356,16 +359,196 @@ def prepare_multimodal_dataset(
     return output_dir
 
 
+def audit_v8(dataset: Path, raw: Path, official_labels: Path) -> None:
+    """核验全部官方训练样本并导出场景缩略图，供有记录地调整验证划分。
+
+    Note:
+        不读取测试集，不执行模型；标签语义不确定时只记录，不自动纠正。
+    """
+    from PIL import Image, ImageDraw
+
+    records = inspect_cleaning(dataset, raw, official_labels)
+    report = dataset.parent / "runs/dataset_cleaning" / f"v8_{datetime.now():%Y%m%d_%H%M%S}"
+    report.mkdir(parents=True, exist_ok=False)
+    (report / "proposed.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+    groups: dict[str, list[dict[str, object]]] = {}
+    for record in records:
+        stem = Path(record["image"]).stem
+        key = stem.rsplit("_", 1)[0] if "_" in stem else f"numeric:{stem}"
+        groups.setdefault(key, []).append(record)
+    group_summary = []
+    for key, members in sorted(groups.items()):
+        counts = Counter(int(line.split()[0]) for row in members for line in row["cleaned"].splitlines() if line.strip())
+        group_summary.append({"group": key, "images": [row["image"] for row in members],
+                              "splits": sorted({row["split"] for row in members}), "class_boxes": dict(counts)})
+    (report / "groups.json").write_text(json.dumps(group_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    jpg = sorted((row for row in records if Path(row["image"]).suffix.lower() in {".jpg", ".jpeg"}), key=lambda row: row["image"])
+    (report / "jpg_index.json").write_text(json.dumps([row["image"] for row in jpg], indent=2), encoding="utf-8")
+    for start in range(0, len(jpg), 49):
+        sheet = Image.new("RGB", (1400, 980), "white")
+        draw = ImageDraw.Draw(sheet)
+        for offset, row in enumerate(jpg[start:start + 49]):
+            x, y = offset % 7 * 200, offset // 7 * 140
+            with Image.open(raw / "visible" / row["image"]) as opened:
+                tile = opened.convert("RGB")
+            tile.thumbnail((196, 110))
+            sheet.paste(tile, (x, y + 25))
+            draw.text((x + 2, y + 3), f"{start + offset + 1}: {row['image']}", fill="black")
+        sheet.save(report / f"jpg_scenes_{start // 49 + 1}.jpg")
+    summary = {"images": len(records), "additional_label_changes": sum(
+        (dataset / row["split"] / "labels" / (Path(row["image"]).stem + ".txt")).read_text(encoding="utf-8-sig") != row["cleaned"]
+        for row in records), "jpg_images": len(jpg), "status": "audited_not_applied"}
+    (report / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"v8 数据核验完成：{summary}；审阅目录：{report}")
+
+
+def review_v8_weak_classes(report: Path, raw: Path) -> None:
+    """导出船、球、三轮车的训练/验证场景及已有框，供人工检查而非模型评估。"""
+    from PIL import Image, ImageDraw
+
+    records = json.loads((report / "proposed.json").read_text(encoding="utf-8"))
+    selected = sorted((row for row in records if any(int(line.split()[0]) in {1, 7, 11}
+                      for line in row["cleaned"].splitlines() if line.strip())), key=lambda row: row["image"])
+    (report / "weak_index.json").write_text(json.dumps([row["image"] for row in selected], indent=2), encoding="utf-8")
+    for start in range(0, len(selected), 49):
+        sheet = Image.new("RGB", (1750, 1190), "white")
+        for offset, row in enumerate(selected[start:start + 49]):
+            with Image.open(raw / "visible" / row["image"]) as opened:
+                tile = opened.convert("RGB")
+            width, height = tile.size
+            draw = ImageDraw.Draw(tile)
+            for line in row["cleaned"].splitlines():
+                category, cx, cy, bw, bh = map(float, line.split())
+                if int(category) in {1, 7, 11}:
+                    draw.rectangle(((cx - bw / 2) * width, (cy - bh / 2) * height,
+                                    (cx + bw / 2) * width, (cy + bh / 2) * height), outline="red", width=3)
+            tile.thumbnail((246, 138))
+            x, y = offset % 7 * 250, offset // 7 * 170
+            sheet.paste(tile, (x, y + 30))
+            caption = f"{start + offset + 1} {row['split']}: {Path(row['image']).stem}"
+            ImageDraw.Draw(sheet).text((x + 2, y + 3), caption, fill="black")
+        sheet.save(report / f"weak_scenes_{start // 49 + 1}.jpg")
+    print(f"弱类审阅图已导出：{len(selected)} 张；{report}")
+
+
+def apply_v8(dataset: Path, raw: Path, official_labels: Path, report: Path) -> None:
+    """按已审阅清单落位清洗数据，保留完整旧 train/val 供恢复。
+
+    Args:
+        dataset: 项目 datasets 目录。
+        raw: 官方训练图像目录。
+        official_labels: 官方新版标签目录。
+        report: 含 proposed.json 与 split_plan.json 的审计目录。
+
+    Note:
+        先核对源指纹，再构建完整暂存目录；只移动明确的 train/val 子目录。
+        移动失败会回滚已切换目录，所有中间文件保留，不修改官方图像。
+    """
+    root = Path(__file__).resolve().parent
+    dataset, report = dataset.resolve(), report.resolve()
+    if dataset != root / "datasets" or not report.is_relative_to(root / "runs/dataset_cleaning"):
+        raise ValueError("v8 落位仅允许本项目 datasets 与 runs/dataset_cleaning 内的审计目录")
+    records = json.loads((report / "proposed.json").read_text(encoding="utf-8"))
+    plan = json.loads((report / "split_plan.json").read_text(encoding="utf-8"))
+    if plan["proposed_sha256"] != file_hash(report / "proposed.json"):
+        raise ValueError("划分计划与审阅数据指纹不一致")
+    by_name = {row["image"]: row for row in records}
+    if len(by_name) != len(records) or len(records) != 2000:
+        raise ValueError("当前 v8 计划限定官方 2000 组，不能丢图或增加外部样本")
+    assignments = {name: row["split"] for name, row in by_name.items()}
+    changed_names: set[str] = set()
+    for change in plan["moves"]:
+        name, target = change["image"], change["to"]
+        if name not in by_name or target not in {"train", "val"} or not change["reason"]:
+            raise ValueError(f"划分变更缺少有效样本、目标或依据：{change}")
+        if name in changed_names or change["from"] != by_name[name]["split"]:
+            raise ValueError(f"重复迁移或原划分不匹配：{name}")
+        changed_names.add(name)
+        assignments[name] = target
+    fingerprint_splits: dict[str, set[str]] = {}
+    for row in records:
+        fingerprint_splits.setdefault(row["source_hashes"]["visible"], set()).add(assignments[row["image"]])
+    if any(len(splits) > 1 for splits in fingerprint_splits.values()):
+        raise ValueError("新划分存在跨集完全相同的 RGB 图像，须将对应场景合并后再落位")
+    # 全量来源核验在任何目录切换前完成，不接受审阅后的未知标签修改。
+    current = inspect_cleaning(dataset, raw, official_labels)
+    if current != records:
+        raise ValueError("数据在审阅后发生变化，请重新生成审计而非覆盖")
+    for split in ("train", "val"):
+        present = {path.name for path in _image_files(dataset / split / "images")}
+        if present != {row["image"] for row in records if row["split"] == split}:
+            raise ValueError(f"{split} 图像清单在审阅后发生变化")
+    staging, backup = report / "staging", report / "before"
+    staging.mkdir(exist_ok=False)
+    backup.mkdir(exist_ok=False)
+    shutil.copy2(dataset / "data.yaml", backup / "data.yaml")
+    counts: dict[str, object] = {}
+    for split in ("train", "val"):
+        for child in ("images", "infrared", "depth", "labels"):
+            (staging / split / child).mkdir(parents=True)
+        members = [row for row in records if assignments[row["image"]] == split]
+        if not members:
+            raise ValueError(f"新划分 {split} 为空")
+        labels = Counter(int(line.split()[0]) for row in members for line in row["cleaned"].splitlines() if line.strip())
+        counts[split] = {"images": len(members), "extensions": dict(Counter(Path(row["image"]).suffix.lower() for row in members)),
+                         "class_boxes": {name: labels[index] for index, name in enumerate(CLASS_NAMES)}}
+        for row in members:
+            for child, modality in (("images", "visible"), ("infrared", "infrared"), ("depth", "depth")):
+                _link_or_validate(raw / modality / row["image"], staging / split / child / row["image"])
+            label = staging / split / "labels" / (Path(row["image"]).stem + ".txt")
+            label.write_text(row["cleaned"], encoding="utf-8")
+    manifest = {"status": "staged", "plan": plan, "counts": counts,
+                "samples": [{"image": row["image"], "before_split": row["split"], "after_split": assignments[row["image"]],
+                             "before_sha256": row["before_sha256"],
+                             "after_sha256": file_hash(staging / assignments[row["image"]] / "labels" / (Path(row["image"]).stem + ".txt"))}
+                            for row in records]}
+    (report / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    completed: list[str] = []
+    try:
+        for split in ("train", "val"):
+            source, saved, replacement = dataset / split, backup / split, staging / split
+            if source.resolve().parent != dataset or saved.resolve().parent != backup or replacement.resolve().parent != staging:
+                raise ValueError("目录解析超出预期位置，拒绝移动")
+            source.rename(saved)
+            try:
+                replacement.rename(source)
+            except BaseException:
+                saved.rename(source)
+                raise
+            completed.append(split)
+    except BaseException:
+        for split in reversed(completed):
+            (dataset / split).rename(staging / split)
+            (backup / split).rename(dataset / split)
+        raise
+    manifest["status"] = "applied"
+    (report / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    summary = {"status": "applied", "images": len(records), "counts": counts,
+               "additional_label_changes": sum(bool(row["changes"]) for row in records),
+               "moved_images": len(changed_names), "backup": "before"}
+    (report / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"v8 清洗数据已落位 datasets：{counts}；旧划分和缓存完整保留：{backup}")
+
+
 def main() -> None:
     """先导出审阅包，再按指定审阅包执行可追溯清洗。"""
     parser = argparse.ArgumentParser(description="审阅并清洗三模态训练标签")
     parser.add_argument("--apply-review", type=Path, help="已经逐图审阅的审计目录，必须包含 approved.json")
+    parser.add_argument("--audit-v8", action="store_true", help="核验清洗数据并导出 JPG 场景审阅图，不运行模型")
+    parser.add_argument("--apply-v8", type=Path, help="应用审阅目录中的 split_plan.json，整份旧划分搬入备份")
+    parser.add_argument("--review-v8", type=Path, help="从已有审计导出弱类场景及标注，不运行模型")
     args = parser.parse_args()
     project_root = Path(__file__).resolve().parent
     dataset = project_root / "datasets"
     raw = project_root / "数据集" / "训练集" / "AIC2026_Train_2000"
     official_labels = project_root / "数据集" / "训练集" / "new_labels_2000"
-    if args.apply_review:
+    if args.audit_v8:
+        audit_v8(dataset, raw, official_labels)
+    elif args.review_v8:
+        review_v8_weak_classes(args.review_v8.resolve(), raw)
+    elif args.apply_v8:
+        apply_v8(dataset, raw, official_labels, args.apply_v8.resolve())
+    elif args.apply_review:
         report = args.apply_review.resolve()
         records = json.loads((report / "proposed.json").read_text(encoding="utf-8"))
         approval = json.loads((report / "approved.json").read_text(encoding="utf-8"))

@@ -1,8 +1,18 @@
 # AIC 城市场景三模态目标检测
 
-使用 YOLO26l 融合 RGB、红外和深度，检测官方 12 个类别。输入为五通道（RGB 3 + 红外 1 + 深度 1），训练入口为 `main.py`。
+使用五通道（RGB 3 + 红外 1 + 深度 1）检测官方 12 类。当前训练入口 `main.py` 使用 D-FINE-L；历史 YOLO26l 权重、训练组件和预测兼容保留。
 
-## 当前状态（2026-09-17）
+最新候选为 **v8**：1280、最多60轮、学习率5e-5/骨干5e-6、10轮耐心早停；关闭v7的定向重复、完整目标裁剪和低清模拟。清洗数据已落位 `datasets`，1709 train / 291 val，保留全部2000组及已有修订，本次新增标签修订0；旧完整数据和缓存保存在 `runs/dataset_cleaning/v8_20260918_162439/before/`。详见 [v8训练方案与数据清洗](docs/v8训练方案与数据清洗.md)。未运行测试、模型评估、推理或训练，用户自行执行 `uv run python main.py`。
+
+v7线上52.4010，v6两份最佳权重55.1490/55.1360，v4的55.6000仍为线上基线。v8验证集发生变化，本地AP不能直接与旧划分排名；不承诺超过60分。predict.py默认权重由用户维护。
+
+## 历史 v6 启动记录（2026-09-18）
+
+v5 best.pt 已确认线上 **51.0830**，SHA256 与提交记录一致；v4 **55.6000** 仍是正式基线。main.py 已切换为 D-FINE-L Objects365 E25 五通道微调：1280、60 轮、3 轮预热、AdamW 主学习率 1e-4/骨干 1e-5、batch=2、有效批次16。关闭 v5 的重采样、定向裁剪与模态缺失。官方源码与权重、必要依赖已在本机准备，尚未启动新训练或运行模型测试，不能声称已提分或验证显存可用。
+
+配置依据、类别初始化和离线复现见 [D-FINE三模态实施方案](docs/D-FINE三模态实施方案.md)。下面 v5 的配置描述是历史，不是当前入口。
+
+## 历史 YOLO v4/v5 记录
 
 初始化说明（2026-09-18）：v5 已从 `orgin_models/yolo26l.pt` 的官方 COCO 预训练重新开始，未续训 v4；使用官方预训练仍可能过拟合。弱类改善不代表整体提高，训练分类损失下降本身不是问题。
 
@@ -18,18 +28,18 @@ v5_full 已完成 234 轮，最高 mAP50=0.59835（41 轮）、mAP50-95=0.40625�
 
 ## 使用
 
-先在本地准备官方数据和 `orgin_models/yolo26l.pt`，然后在项目根目录执行：
+本机已经准备现有 datasets、官方 `vendor/D-FINE` 固定源码和 `orgin_models/dfine_l_obj365_e25.pth`。在项目根目录执行：
 
 ```powershell
 uv sync
 uv run python main.py
 ```
 
-当前运行名为 `AIC_RGBIRDepth_yolo26l_1280_v5_full`，新训练重名自动递增。best.pt 按 mAP50-95 选取，另存 best_map50.pt/best_map5095.pt。仅恢复同配方中断运行时设置 RESUME_PATH；旧 v5_weakclass 配方与已完成且剥离优化器的 last.pt 不作为原状态续训入口。
+当前运行名为 `AIC_RGBIRDepth_dfine_l_1280_v8`，重名时新建时间戳目录。best.pth 按 mAP50-95 选取，另存 best_map50.pth、last.pth 和每5轮检查点。仅恢复同配方中断运行时设置 RESUME_PATH，恢复也写新目录；已完成或早停的任务拒绝恢复。入口会核对数据审计，正式训练另存分域指标和审计快照。新机器请先按实施方案准备公开依赖及数据，训练本身不会联网。
 
-`准备三模态数据集.py` 默认生成清洗审阅包，确认记录后用 `--apply-review` 落位；日常训练无需运行。模块中的历史重建函数会恢复官方标注，不应拿来覆盖清洗版。`三模态训练.py` 提供加载器和训练器，资源释放由用户管理。
+`准备三模态数据集.py` 默认生成清洗审阅包；v8 已通过 `--audit-v8`、`--review-v8` 与审阅后的 `--apply-v8` 完成落位，日常训练无需再运行。模块中的历史重建函数会恢复官方标注，不应拿来覆盖清洗版。`三模态训练.py` 提供共享加载组件和历史 YOLO 训练器，资源释放由用户管理。
 
-按用户要求，评估脚本、tests、config_checks 与 pytest 缓存已移出原位置，可从 runs/code_cleanup/ 恢复。不会自动执行测试、复评、额外推理或训练。pytest 的开发依赖保留，不影响训练，也不会自行执行；本轮不更新环境或锁文件。
+按用户要求，评估脚本、tests、config_checks 与 pytest 缓存已移出原位置，可从 runs/code_cleanup/ 恢复。不会自动执行测试、复评、额外推理或训练。pytest 的开发依赖保留，不会自行执行。D-FINE 新增依赖已写入 pyproject.toml/uv.lock，没有替换现有 torch/torchvision/Ultralytics。
 
 ## 本地目录
 
@@ -42,12 +52,16 @@ datasets/
 ├── AIC2026_Train_2000/{visible,infrared,depth,labels}
 └── new_labels_2000/
 orgin_models/                       # 本地预训练权重
+vendor/D-FINE/                      # 固定版本官方源码（不入库）
 runs/                              # 当次权重、日志与曲线
 ```
 
 三种模态均位于 datasets 的对应划分内，以官方原图硬链接复用；标签是独立清洗副本。清洗备份与逐行记录在 `runs/dataset_cleaning/20260917_012026/`。硬链接图像不能原地改写。仅 datasets/data.yaml 入库，数据与运行产物不入库。
 
 ## 文档导航
+
+- [v8当前方案与数据清洗](docs/v8训练方案与数据清洗.md)：新配置、数据备份、划分变化、启动与预测命令。
+- [D-FINE历史实施](docs/D-FINE三模态实施方案.md)：固定源码、预训练来源、类别迁移。
 
 - [数据来源、问题与划分](docs/数据集成分与划分记录.md)：新版类别统计、ball 核验、边缘框、验证集不足。
 - [训练配方与实验记录](docs/训练配置与数据集复核.md)：两次完成训练对比、球类退化诊断、双头损失日程及下一轮实验；历史配置单独保留。
@@ -58,9 +72,21 @@ runs/                              # 当次权重、日志与曲线
 
 ## 预测与初赛提交
 
+已恢复历史YOLO逐张原生单标签推理路径，使用：
+
 ```powershell
-uv run python predict.py
+uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_yolo26l_1280_v4_clean_lr1e4/weights/best.pt --imgsz 1280 --yolo-profile v4 --output predict_v4_restored
 ```
+
+YOLO默认选v4路径；现有批量自定义后处理用 `--yolo-profile current`。D-FINE使用独立原生后端，不能套用YOLO后处理，当前用户v7默认权重保持不变。历史来源和边界见 [预测文档](docs/预测与赛事提交.md)。
+
+```powershell
+uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_dfine_l_1280_v8/weights/best.pth --imgsz 1280 --batch 18 --output predict_v8
+```
+
+上述命令在 v8 训练产生权重后使用，若运行目录带时间戳须换成实际目录。predict.py 保留用户当前选择的 v7 best.pth 路径，不自动选择最新运行；历史五通道 YOLO .pt 仍可通过 --weights 使用，输出结构不变。
+
+预测入口采用与 main.py 相同的 `PredictionConfig` 分节配置，实现在 `三模态预测.py`。当前用户入口为 FP32、1536、batch=18、8个读取线程、8个保存线程、预取10批；预测v8须如上显式切换权重和1280。可用 `--batch` 调整，不自动试跑探测显存。本轮未测试、未测速，实际吞吐量由正式预测结束时日志记录。
 
 `predict.py` 自动配对官方初赛 1000 组三模态，生成 `predict/images` 带框图片、`predict/labels` 六列标签，以及 `predict/比赛提交内容/submission.zip`。**初赛只提交该 ZIP**，不上传图片或本地运行 JSON。已有输出目录会报错，不覆盖；重复预测使用 `--output predict_v3` 等新目录。
 

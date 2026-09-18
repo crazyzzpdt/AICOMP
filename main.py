@@ -1,174 +1,118 @@
-"""在 RTX 5080 16 GB 上训练 YOLO26l RGB、红外、深度融合检测模型。
+"""在本机训练 D-FINE-L RGB、红外、深度五通道融合检测模型。
 
-保留「docs/Ultralytics训练参数参考.md」的 83 个参数，并显式设置验证阈值。
-训练直接使用 datasets/train、datasets/val 与 datasets/data.yaml，标签为可追溯清洗版本。
-v5_full 使用受限弱类重采样、原尺寸同步目标裁剪、RGB 独立增强和骨干低学习率。
-学习率在前 200 轮完成衰减，第 161 轮起关闭 Mosaic、目标裁剪与辅助模态缺失。
-5000 轮仍影响双头损失日程；patience=200 为完整模态收尾留出训练机会。
-best.pt 按 mAP50-95 选取，另存 best_map50.pt、best_map5095.pt 与逐类 AP 记录。
-配置依据、数据划分局限和本机实测见「docs/训练配置与数据集复核.md」。
-在项目目录执行 uv run python main.py 开始训练。
+从本地 Objects365 E25 公开预训练权重迁移，不续训 v4/v5，不增加外部训练数据。
+直接读取 datasets 的清洗标签与 v8 场景审阅划分；结果保存在独立的 v8 目录。
+1280 输入、降低学习率、温和同步增强，正式训练内早停并记录 PNG/JPG 分域指标。
+参数为待用户正式训练验证的候选配方，不承诺超过 60 分。
 
-断点续训（将路径改为实际运行目录）：
-    将 RESUME_PATH 设置为新配方运行目录的 weights/last.pt，再运行本文件。
-    续训恢复检查点中的优化器和训练参数；修改配方时应保持 RESUME_PATH=None。
+在项目根目录执行训练：
+    uv run python main.py
+预测新模型并生成赛事提交包：
+    uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_dfine_l_1280_v8/weights/best.pth --imgsz 1280 --batch 18 --output predict_v8
+断点恢复：
+    将 RESUME_PATH 改为同配方中断运行的 weights/last.pth，再运行本文件。
+    恢复写入新的运行目录，原结果不覆盖；完成的检查点拒绝当作中断任务恢复。
 
-该模型输入为五通道，不能用只提供 visible 图的通用 yolo predict 命令推理；
-提交推理也必须以同名 RGB、红外、深度图融合后再送入模型。
+本轮依据与限制见 docs/v8训练方案与数据清洗.md；不自动启动训练或测试。
 """
+
 # 内置库
 import os
 from pathlib import Path
-# 必须在导入 Ultralytics 前设置，训练时关闭联网检查和自动安装依赖。
+
+# 必须在导入模型组件前设置，训练与预测不联网或上传遥测。
 os.environ["YOLO_OFFLINE"] = "true"
 os.environ["YOLO_AUTOINSTALL"] = "false"
-# 三方库
-import torch
-from ultralytics import YOLO
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 # 自己的模块
-from 训练优化 import OptimizedMultimodalTrainer
+from D细化训练 import TrainingConfig, train
 
 
-# v4 已取得线上 55.6000 分，保留同一基底；从 COCO 重新迁移以恢复球类初始化。
-MODEL_PATH: str = r"./orgin_models/yolo26l.pt"
-# 12 类清洗版三模态配置，三种图像及独立标签均在 datasets 的既有 1744/256 划分内。
-DATA_PATH: str = r"./datasets/data.yaml"
-# 训练结果根目录
-PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-# 本轮更换优化配方，从本地 COCO 权重重新训练；仅恢复同配方运行时填写 last.pt。
+# 官方 D-FINE-L Objects365 E25 权重已预先下载；不读取 v5 项目检查点作为基底。
+MODEL_PATH: str = "./orgin_models/dfine_l_obj365_e25.pth"
+# v8 清洗数据统一落在 datasets；划分与标签须匹配下方审计记录。
+DATA_PATH: str = "./datasets/data.yaml"
+# 清洗与分组审阅的落位记录；训练入口只校验，不自动清洗或移动数据。
+DATA_AUDIT: str = "./runs/dataset_cleaning/v8_20260918_162439/manifest.json"
+# 新架构单独存放，已有同名结果自动使用时间戳目录。
+PROJECT_PATH: str = "./runs/detect"
+# 沿用 v6 的 60 轮余弦周期；连续 10 轮无有效提升时提前结束，不强行跑满。
+MAX_EPOCHS: int = 60
+# 沿用 v6 第 41 轮关闭尺度扰动；早停可能先于收尾发生。
+POLISH_EPOCH: int = 40
+# 主学习率和骨干学习率均相对 v6 减半，避免与新增强增强同时调整。
+INITIAL_LR: float = 0.00005
+# 区分新框架与历史 YOLO 配方，便于对照得分。
+RUN_NAME: str = "AIC_RGBIRDepth_dfine_l_1280_v8"
+# 仅填写同配方中断任务的 last.pth；正常新训保持 None。
 RESUME_PATH: str | None = None
-# 保留用户设置的训练上限；调整此值时自动同步 Mosaic 的末段轮数。
-MAX_EPOCHS: int = 5000
-# 弱类重采样增加每轮样本，采用较低拼图概率，并延后关闭以保持场景多样性。
-MOSAIC_EPOCHS: int = 160
-# 沿用 v4 学习率，训练器将预训练骨干降为 0.2 倍；首层与检测头正常学习。
-INITIAL_LR: float = 0.0001
-# 原尺寸裁剪与收尾阶段单独命名，保留旧 v5 配方及 v4 正式成绩基线。
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v5_full"
 
 
-# Windows 创建 DataLoader 子进程时会重新导入当前脚本，因此训练代码必须放在入口保护内。
+# Windows DataLoader 子进程会重新导入入口，正式训练必须放在入口保护内。
 if __name__ == "__main__":
-
     os.chdir(Path(__file__).resolve().parent)
-    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
-        raise RuntimeError("当前配置需要支持 BF16 的 CUDA 显卡")
-    if not Path(RESUME_PATH or MODEL_PATH).is_file() or not Path(DATA_PATH).is_file():
-        raise FileNotFoundError("模型权重或三模态数据配置不存在，请检查路径")
-    if RESUME_PATH:
-        YOLO(RESUME_PATH).train(
-            trainer=OptimizedMultimodalTrainer,
-            resume=True,
-            data=DATA_PATH,
-            workers=4,
-            cache="disk",
-            save_dir=str(Path(RESUME_PATH).resolve().parent.parent),
-        )
-        raise SystemExit(0)
-    # 实例化模型类
-    model: YOLO = YOLO(str(MODEL_PATH), task="detect")
-    # 训练函数
-    model.train(
-        trainer=OptimizedMultimodalTrainer,  # 受限弱类采样、同步增强、分层学习率及双指标权重留存
+    train(TrainingConfig(
         # 一、模型、数据与训练时长
-        model=str(MODEL_PATH),  # 显式记录本次训练使用的本地权重；与上方加载路径保持一致
-        data=str(DATA_PATH),  # 12 类检测数据集配置
-        pretrained=True,  # 初始训练从 MODEL_PATH 指向的官方预训练权重开始
-        cls_remap=True,  # 按名称迁移类别输出参数；自定义训练器补充 sports ball 到 ball 的对应
-        epochs=MAX_EPOCHS,  # 最大训练轮数；与下方关闭 Mosaic 的轮数使用同一个上限
-        time=None,  # 最大训练小时数；设置后覆盖 epochs 限制
-        patience=200,  # 为第 161 轮后的完整模态收尾留出机会；仍按历史最佳保存，不保证末轮最好
-        batch=4,  # v3 完成 250 轮验证过的批次；资源配置保持稳定以便比较配方
-        imgsz=1280,  # 32 的整数倍；相比 960，提高小目标在输入图中的有效像素数
-        fraction=1.0,  # 使用清洗后的全部 1744 张训练图，256 张验证图不参与训练
-        single_cls=False,  # 不将所有类别合并为一个类别
-        classes=None,  # None 使用全部类别，也可指定类别 ID 列表
-
-        # 二、设备、性能与可复现性
-        device=0,  # PyTorch 中的 CUDA 设备编号（本机 RTX 5080）
-        workers=4,  # 保留用户配置；自定义加载器训练与验证均使用 4 个进程
-        cache="disk",  # 五通道完整原尺寸缓存约 18 GiB；保留已完成训练的磁盘缓存方案
-        amp="bf16",  # RTX 5080 原生支持；本机已验证有限损失和梯度，且无需 FP16 的缩放器
-        quantize=None,  # None 关闭量化感知训练；8/"int8" 开启 QAT
-        seed=0,  # 随机种子
-        deterministic=True,  # 使用确定性算法，尽量保证可复现性
-        profile=False,  # 是否在训练时分析 ONNX/TensorRT 推理速度
-        freeze=None,  # 不冻结；可设置前 N 层或层索引/模块名称列表
-        compile=False,  # 关闭 torch.compile；可设 True 或支持的编译模式字符串
-        channels_last=False,  # 保持已实测的 NCHW 内存布局
-        verbose=True,  # 输出详细训练信息
-
-        # 三、结果保存与恢复
-        save=True,  # 保存训练检查点和最终权重
-        save_period=50,  # 两种 AP 最佳权重逐轮留存；每 50 轮额外保存完整检查点以控制磁盘增长
+        model=MODEL_PATH,  # 官方 366 输出槽的 Objects365 模型，按比赛类别迁移
+        data=DATA_PATH,  # 只读 datasets，不改原始图像或清洗标签
+        data_audit=DATA_AUDIT,  # 核验已落位清单与全部标签指纹，拒绝无记录的数据改动
         project=PROJECT_PATH,  # 训练结果根目录
-        name=RUN_NAME,  # v5 配方单独保存，保留前三次训练产物与线上基线
-        exist_ok=False,  # 同名目录已存在时自动递增运行目录名
-        save_dir=None,  # 指定确切输出目录会覆盖 project/name，且不自动递增
-        resume=False,  # 首次训练；续训在上方 RESUME_PATH 填写 last.pt，由独立分支恢复
+        name=RUN_NAME,  # 新运行不覆盖历史产物
+        epochs=MAX_EPOCHS,  # 固定短周期，不再以 5000 轮上限控制收尾
+        resume=RESUME_PATH,  # 恢复时校验配方、源码版本和数据签名
 
-        # 四、优化器、学习率与预热
-        optimizer="AdamW",  # 针对 1744 张的小数据预训练微调试验；避免沿用旧 MuSGD 的高学习率配方
-        lr0=INITIAL_LR,  # 首层/颈部/检测头 0.0001，预训练骨干 0.00002，减轻迁移特征遗忘
-        lrf=0.01,  # 最终学习率比例，最终学习率为 lr0 * lrf
-        momentum=0.9,  # AdamW 的 beta1，与原动量数值一致
-        weight_decay=0.0005,  # 权重衰减
-        warmup_epochs=5.0,  # 预热期间逐步调整学习率和梯度累积，适应新的 12 类检测头
-        warmup_momentum=0.8,  # 预热阶段的初始动量
-        warmup_bias_lr=0.0,  # 与本版本 auto 行为一致，避免预热初期偏置学习率过高
-        cos_lr=True,  # 自定义训练器在前 200 轮余弦衰减，此后保持 lr0*lrf，独立于总轮数上限
-        nbs=16,  # batch=4 时预热后约累积 4 批，有效批次约 16，保持 v3 的更新频率
+        # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
+        imgsz=1280,  # 回到线上优于 v7 的 v6 尺寸，取消未经证实有益的 1536 放大
+        batch=4,  # v6 args.yaml 的实际物理批次；资源参数仍由用户调整
+        effective_batch=16,  # 物理 batch=4 时累积 4 批，保持 v6 有效批次
+        val_batch=1,  # FP32 轮末验证与正式预测同精度，减少峰值显存
+        workers=4,  # 每进程预取 1 批、关闭锁页，不将完整数据集缓存到 RAM
+        device=0,  # 本机 RTX 5080；训练使用 BF16 前向与 FP32 匹配/损失
+        seed=0,  # 固定种子；GPU 算子仍可能存在非确定性
 
-        # 五、检测损失与可选知识蒸馏
-        box=7.5,  # 边界框损失权重
-        cls=0.5,  # 分类损失权重
-        cls_pw=0.0,  # v5 用受限采样提高弱类曝光；关闭同时放大该类负样本 BCE 的频次加权
-        dfl=1.5,  # 框距离回归损失权重，YOLO26 无 DFL 检测头使用 L1 损失
-        distill_model=None,  # 不使用教师模型；可填本地教师权重的路径字符串
-        dis=6.0,  # 开启知识蒸馏后的蒸馏损失权重
+        # 三、优化器、学习率与收敛
+        lr0=INITIAL_LR,  # AdamW 检测头/颈部/首层学习率
+        backbone_lr=0.000005,  # 相对 v6 减半；新增模态首层仍使用主学习率
+        lrf=0.01,  # 沿用 60 轮余弦周期；早停不提前压缩学习率曲线
+        lr_schedule="optimizer_step",  # 按实际优化步衰减；每轮重采样数量变化时学习率不跳变
+        warmup_epochs=3,  # 新类别头和新增输入通道短预热，不照搬 30 轮
+        weight_decay=0.0001,  # 恢复 v6 实际配置，避免与学习率同时叠加更强权重衰减
+        clip_grad=0.1,  # 沿用 DETR 类模型常见梯度裁剪，非有限梯度立即报告
+        ema_decay=0.999,  # 单一训练轨迹的 EMA 用于验证与预测，不融合多个模型输出
+        ema_warmup=100,  # 按真实优化步预热 EMA，兼容梯度累积后的更新频率
 
-        # 六、训练期间验证
-        val=True,  # 开启验证
-        split="val",  # 使用独立验证集，不把官方测试集用于选权重
-        conf=0.001,  # 保留低分候选用于计算完整 PR 曲线；不是展示图片时的置信度阈值
-        iou=0.7,  # NMS 去重阈值，与 mAP50-95 的评测 IoU 阈值区间不是同一含义
-        nms=True,  # 明确使用一对多头；v5 验证器的单标签 NMS 与现有 predict.py 对齐
-        max_det=100,  # 对齐比赛每图最多 100 个预测框；当前官方训练标注最大为 66 个
-        plots=True,  # 保存训练曲线、验证指标和预测示例图
+        # 四、同步增强：回到 v6 温和配方，关闭 v7 新增的裁剪与低清模拟
+        polish_epoch=POLISH_EPOCH,  # 第 41 轮起关闭尺度扰动；不因早停而补跑收尾
+        scale_min=0.9,  # 沿用 v6 的 0.9–1.0 尺度，不裁掉边缘目标
+        crop_prob=0.0,  # 关闭完整目标裁剪，避免与降学习率同时引入尺度分布变化
+        crop_min=0.75,  # 裁剪关闭时不使用，保留兼容配置
+        lowres_prob=0.0,  # 关闭人工低清模拟；真实 JPG 域由官方图像覆盖
+        lowres_min=0.6,  # 低清模拟关闭时不使用
+        fliplr=0.5,  # 三模态与标签严格同步水平翻转
+        hsv_h=0.01,  # 仅增强 RGB，红外和深度不做颜色变换
+        hsv_s=0.15,  # 温和饱和度变化
+        hsv_v=0.15,  # 温和亮度变化
 
-        # 七、检测数据增强
-        rect=False,  # 矩形批次最小填充；False 使用正方形输入
-        multi_scale=0.0,  # 多尺度尺寸变化比例；0 关闭，例如 0.25 表示 0.75~1.25 倍
-        close_mosaic=max(MAX_EPOCHS - MOSAIC_EPOCHS, 0),  # 第 161 轮同时关闭拼图、目标裁剪与模态缺失，轻度 RGB 增强继续
-        hsv_h=0.0,  # 框架整图 HSV 关闭；训练优化.py 仅对 RGB 三通道施加轻度 HSV
-        hsv_s=0.0,  # 同上
-        hsv_v=0.0,  # 同上
-        degrees=0.0,  # 随机旋转角度范围 ±degrees
-        translate=0.05,  # 减少边缘小目标被平移裁掉，同时保留弱类上下文裁剪
-        scale=0.2,  # 缩放约 0.8~1.2；目标裁剪另行提供放大，降低小球被缩至无效尺寸的概率
-        shear=0.0,  # 随机剪切角度
-        perspective=0.0,  # 透视变换幅度，通常为 0~0.001
-        flipud=0.0,  # 上下翻转概率
-        fliplr=0.5,  # 左右翻转概率
-        bgr=0.0,  # RGB/BGR 通道顺序翻转概率
-        mosaic=0.25,  # 降低拼图比例以保护小目标，前 160 轮保留四图场景组合
-        mixup=0.0,  # MixUp 图像混合概率
-        cutmix=0.0,  # CutMix 局部区域混合概率
-        augmentations=None,  # 自定义 Albumentations 变换对象列表，仅 Python API 支持
+        # 五、采样：每张训练原图每轮一次，不重复弱类或降低其他类别采样次数
+        boat_repeat=1.0,  # v7 的船类未改善，本轮取消定向重复
+        garbage_repeat=1.0,  # 单类改善未转化为线上总体收益，恢复普通采样
+        repeat_extra_fraction=0.0,  # 不增加额外样本
+        repeat_group_limit=4,  # 重采样关闭时不使用
 
-        # 八、参考表中的其他任务专用参数：完整列出，当前 detect 任务不使用
-        pose=12.0,  # 姿态估计：姿态损失权重
-        kobj=1.0,  # 姿态估计：关键点目标性损失权重
-        rle=1.0,  # 姿态估计：残差对数似然损失权重
-        angle=1.0,  # OBB 旋转框：角度损失权重
-        dlog=1.0,  # 深度估计：SILog 损失权重
-        dgrad=0.5,  # 深度估计：梯度损失权重
-        dlam=1.0,  # 深度估计：SILog 方差关注因子
-        overlap_mask=True,  # 实例分割：合并对象掩码
-        mask_ratio=4,  # 实例分割：掩码下采样比例
-        dropout=0.0,  # 分类：随机丢弃率
-        copy_paste=0.0,  # 分割/OBB：对象复制粘贴比例
-        copy_paste_mode="flip",  # 分割/OBB：复制粘贴策略，支持 flip/mixup
-        auto_augment="randaugment",  # 分类：自动增强策略
-        erasing=0.4,  # 分类：随机擦除概率
-    )
+        # 六、D-FINE 原生损失：沿用官方权重，不与重采样叠加 YOLO cls_pw
+        loss_vfl=1.0,  # 质量感知分类损失，不把 YOLO cls=0.5 或 cls_pw=0.25 当作等价设置
+        loss_bbox=5.0,  # L1 框回归权重，不是 YOLO box=7.5 的直接对应数值
+        loss_giou=2.0,  # GIoU 定位约束，与 L1 联合优化，暂不盲目放大垃圾桶框损失
+        loss_fgl=0.15,  # 官方细粒度定位损失，与 YOLO DFL 不同
+        loss_ddf=1.5,  # 官方模型内部定位自蒸馏项，不额外加载老师模型或集成模型
+
+        # 七、随训练验证与权重留存
+        conf=0.001,  # 与预测一致，保留低分候选计算 AP，不作为图片展示阈值
+        max_det=100,  # 赛事每图最多 100 框；原生 D-FINE 查询排序，不使用 YOLO NMS
+        save_period=5,  # 每 5 轮留完整检查点，减少错过中段泛化较好权重的风险
+        patience=10,  # mAP50-95 连续 10 轮无有效提升时早停，停止状态随断点保存
+        min_delta=0.0005,  # 累计超过 0.05 个百分点才重置耐心；任何真实新高仍保存 best
+        domain_metrics=True,  # 复用轮末预测记录 PNG/JPG 总体及逐类指标，不额外模型前向
+    ))

@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+2026-09-18 最新状态已覆盖为 v8：main.py 使用 D-FINE-L、1280、batch=4/有效16、最多60轮、lr=5e-5/骨干5e-6、patience=10；关闭v7重采样、裁剪与低清模拟。数据已按审阅清单落位 datasets 的1709/291，保留全部2000组、既有清洗修订，新增标签修订0；旧完整数据及缓存可从 runs/dataset_cleaning/v8_20260918_162439/before 恢复。不得用下文历史配置覆盖v8，不恢复v7断点，不自动测试、评估或训练。predict.py默认由用户维护，v8需显式传新权重与1280尺寸。以 docs/v8训练方案与数据清洗.md 和 AGENTS.md 顶部为准；下文是历史。
+
+2026-09-18 最新入口为 D-FINE v6：main.py → D细化训练.py，五通道、Objects365 E25、1280、60轮、3轮预热、主学习率1e-4/骨干1e-5。训练尚未运行，用户自行启动，不自动测试。v5 best.pt线上51.0830，v4 55.6000保留为正式基线。predict.py兼容YOLO .pt与D-FINE .pth；新权重需显式指定。当前断点文件为last.pth，不是下文历史last.pt。完整状态以docs/D-FINE三模态实施方案.md为准，下文v5与v4参数均为历史。
+
 用户优先要求：不自动运行测试、评估、额外推理或训练，不新建测试脚本；只分析现有产物与必要差异。评估模型.py、tests/、runs/config_checks 已移入 runs/code_cleanup/ 可恢复备份。v5_full 已完成，见 docs/v5训练完成复盘.md；下方旧进度保留为历史，不能据此再次启动训练。
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.

@@ -2,6 +2,16 @@
 
 ## 当前优先约束
 
+2026-09-18 推理恢复追加：YOLO预测默认yolo_profile=v4，从Git历史86411da恢复原尺寸逐张、矩形填充、框架原生单标签NMS；现有批量自定义候选路径用current，多标签须current。D-FINE忽略yolo_profile，仍用训练一致的原生查询排序；不能拿YOLO路径直接预测v7。predict.py用户默认v7权重保持不变。本次仅静态核对，未运行测试或模型推理，不承诺恢复后涨分。评分文档按官方mAP50-95口径，不保留经验加权公式。详见docs/预测与赛事提交.md。
+
+2026-09-18 最新授权与实施为 v8，优先于下面所有历史配方：main.py 使用 D-FINE-L Objects365 E25、1280、batch=4、有效批次16、最多60轮、3轮预热、主学习率5e-5/骨干5e-6、weight_decay=1e-4；关闭目标裁剪、低清模拟和弱类重复，patience=10/min_delta=0.0005。正式训练复用验证预测记录 PNG/JPG 分域 AP，不额外模型前向。已按审阅场景方案将 datasets 更新为1709 train/291 val，保留全部2000组和既有清洗修订，本次新增标签修订0；旧1744/256及缓存完整保存在 runs/dataset_cleaning/v8_20260918_162439/before。审计清单由 main.py 的 DATA_AUDIT 指定；不得恢复旧v7断点或用历史重建覆盖清洗数据。v7线上52.4010，v4的55.6000仍为基线；v8尚未训练，不保证提分。predict.py保留用户v7默认值，预测v8须显式权重和imgsz=1280。没有自动测试、评估、推理或训练；下一步用户自行运行 main.py。详见 docs/v8训练方案与数据清洗.md。下方“当前”和“不改划分”等均是对应历史阶段约束，禁止据此撤回用户本轮授权的v8。
+
+v7后续授权追加：仅boat/garbage can受限重复，倍率1.5/1.25为限额前期望；单图最多2次、额外总量≤10%、文件名近似组额外≤4张，第31轮关闭。学习率用optimizer_step按采样计划的真实优化步计数，累积尾组按当轮样本数归一化；weight_decay=0.000125；D-FINE原生损失权重在main.py显式配置，沿用官方默认。sampling_history.csv只在用户正式训练时写出；不运行测试或额外评估。不能恢复新增配方前的旧v7断点。
+
+2026-09-18 后续已授权 v7：main.py 仍使用 D-FINE-L Objects365 E25，1536、batch=2、有效批次16、40轮、3轮预热，第31轮关闭尺度/完整目标裁剪/低清模拟；新增训练增强位于 D细化训练.py。v6两份最佳权重线上55.1490/55.1360，未超v4的55.6000。2000个当前标签匹配清洗审计，当前数据签名匹配v6记录，不能声称v6未用清洗数据。不自动测试、评估或训练，不自动改数据划分；下一步用户运行main.py。新模型预测须显式1536，用户predict.py默认v6权重不改。详见docs/v7训练方案与清洗核验.md。下面v6/v5入口配置为历史，禁止据此覆盖v7。
+
+2026-09-18 当前入口已切换为 v6 D-FINE-L：main.py → D细化训练.py，官方 Objects365 E25 预训练、RGBIRDepth 五通道、1280、batch=2、有效批次16、60轮、3轮预热、AdamW主1e-4/骨干1e-5。源码固定在 vendor/D-FINE（不入库），依赖与预训练权重已准备。predict.py 兼容旧 YOLO .pt 与新 D-FINE .pth，用户原有默认权重路径保留。v5 best.pt 已确认线上51.0830，v4 55.6000仍为正式基线。没有执行模型前向、测试或训练，下一步由用户运行 main.py；禁止以旧段落再次改回 v5。详见 docs/D-FINE三模态实施方案.md。下文 v5 参数为历史实施记录。
+
 用户明确要求控制工具调用与 token：不自动运行 pytest、冒烟测试、模型评估、额外推理或训练；不为调用技能新建测试与评估脚本。只读取已有训练产物，必要时检查引用和实际差异。只有用户明确要求才执行测试或评估，提交前也不自动测试；必须如实说明未测试，不宣称已验证运行正确性。
 
 v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0.59835（41 轮）；后期过拟合，不能描述为全面胜过 v4。ball 最终 best.pt AP50=0.423。详见 docs/v5训练完成复盘.md。下方训练设置是已完成配方，不代表新的重训授权。
@@ -12,10 +22,11 @@ v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0
 
 ## 项目结构与模块组织
 
-- `main.py`：训练入口（唯一）。YOLO26l 三模态五通道（RGB 3 + 红外 1 + 深度 1）融合检测；v5 优化组件在训练优化.py。
+- `main.py`：训练入口（唯一）。当前 D-FINE-L 五通道训练，组件在 D细化训练.py；历史 YOLO v5 组件训练优化.py 保留。
+- `D细化训练.py`：官方 D-FINE 模型适配、数据加载、正式训练循环与预测坐标还原；不单独作为入口。
 - `predict.py`：离线三模态预测入口，生成 `predict/images`、`predict/labels`、`predict/比赛提交内容/submission.zip`，已有输出目录不覆盖。
 - `三模态训练.py`：自定义训练器 `MultimodalDetectionTrainer` 与五通道数据加载；由 `main.py` 导入，不可直接作为独立训练入口运行。
-- `准备三模态数据集.py`：保留既有 1744/256 图像划分，将 `datasets/train` 和 `datasets/val` 原地更新为新版标注；仅在需要重建时运行。
+- `准备三模态数据集.py`：审计、审阅和清洗落位组件；v8 按记录使用 1709/291 划分，旧 1744/256 完整备份，日常训练无需运行。
 - 评估模型.py、tests/ 与 runs/config_checks 已从工作位置移入 runs/code_cleanup/ 的可恢复备份；不是训练或预测依赖。
 - `datasets/`：仅包含 `train/`、`val/` 与必需的 `data.yaml`；仅 `datasets/data.yaml` 入库。
 - `数据集/`（官方原始数据）与 `runs/`（训练产物）不入库；`orgin_models/` 存放本地权重（不入库）。
@@ -25,9 +36,9 @@ v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0
 
 - `uv sync`：根据 `pyproject.toml` 和 `uv.lock` 创建或更新环境。
 - `uv run python main.py`：开始训练（在项目根目录执行）。
-- `uv run python predict.py`：预测官方初赛测试集并打包；当前默认 v4_clean_lr1e4 的 best.pt，mAP50 优先候选为同目录 epoch50.pt（实际第 51 轮），用 --weights 与 --output 显式指定。
+- `uv run python predict.py`：预测官方初赛测试集并打包；默认权重由用户维护。新模型显式使用 `--weights runs/detect/AIC_RGBIRDepth_dfine_l_1280_v6/weights/best.pth --output predict_v6`，不自动选择最新运行。
 - `uv run python 准备三模态数据集.py`：使用官方新版标注更新 `datasets/train`、`datasets/val` 和五通道配置。
-- 断点续训：RESUME_PATH 仅填写同配方中断运行的实际 last.pt；已完成并剥离优化器的检查点不作为原状态续训入口。更换配方保持 None。
+- 断点续训：当前 RESUME_PATH 仅填写同配方中断运行的实际 last.pth，恢复写入新目录；已完成60轮拒绝恢复，更换配方保持 None。下文 last.pt 指历史 YOLO。
 - 已完成 v5 配方：AdamW、lr0=0.0001（骨干 0.2 倍）、nbs=16、batch=4、patience=200；MAX_EPOCHS=5000，学习率前 200 轮衰减，第 161 轮关闭 Mosaic/目标裁剪/模态缺失。训练/验证各 4 个加载进程、预取 1 批、关闭锁页；epochs 仍影响双头损失日程。
 - 初始化澄清：v5 从 orgin_models/yolo26l.pt 官方 COCO 预训练重新迁移，resume=false，未续训 v4；重新初始化不保证消除过拟合。弱类采样、双指标留存已启用，多标签预测为默认关闭的可选开关，不同基底未启用。不自动重训，详见 docs/v5训练完成复盘.md。
 

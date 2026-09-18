@@ -278,3 +278,7 @@ runs/
 # 落位后的训练数据不入库，仅保留类别配置文件
 datasets/*
 !datasets/data.yaml
+
+# 官方 D-FINE 源码与预训练权重仅本地准备，版本在文档与适配代码中固定。
+/vendor/
+/orgin_models/
