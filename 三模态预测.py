@@ -41,6 +41,7 @@ from ultralytics.utils import nms, ops
 
 # 自己的模块
 from 三模态训练 import fuse_modalities
+from 三模态融合 import FusionDetectionModel, FusionPredictor, FUSION_VERSION, canvas_shape, letterbox_fused
 from 准备三模态数据集 import CLASS_NAMES, IMAGE_SUFFIXES
 
 if TYPE_CHECKING:
@@ -78,6 +79,8 @@ class PredictionConfig:
     log_every: int
     # 恢复历史 YOLO 逐张原生后处理；D-FINE 后端不读取该设置。
     yolo_profile: str = "v4"
+    # 新融合模型的内容高度；旧YOLO/D-FINE保持各自历史预处理。
+    height: int = 1080
 
 
 @dataclass
@@ -133,7 +136,7 @@ def validate_model(model: YOLO) -> None:
         ValueError: 任务、首层通道数或类别编号不符。
     """
     first_conv = next((layer for layer in model.model.modules() if isinstance(layer, torch.nn.Conv2d)), None)
-    if model.task != "detect" or first_conv is None or first_conv.in_channels != 5:
+    if model.task != "detect" or first_conv is None or (first_conv.in_channels != 5 and not isinstance(model.model, FusionDetectionModel)):
         raise ValueError("必须使用训练后的五通道检测权重，不能使用 orgin_models 中的 RGB 预训练权重")
     if model.names != dict(enumerate(CLASS_NAMES)):
         raise ValueError(f"模型类别编号与比赛 12 类不一致：{model.names}")
@@ -264,18 +267,22 @@ def predict_yolo_batch(model: YOLO, images: list[np.ndarray], config: Prediction
     return results
 
 
-def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: int) -> PredictionSample:
-    """在读取线程中融合模态，并提前完成 D-FINE 的同步缩放与填充。"""
+def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: int, height: int = 1080) -> PredictionSample:
+    """在读取线程中融合模态，并完成相应后端的同步缩放与填充。"""
     fused = fuse_modalities(*paths)
     if fused.dtype != np.uint8 or fused.ndim != 3 or fused.shape[2] != 5:
         raise ValueError(f"预测输入必须是 uint8 五通道图：{paths[0].name}")
     if backend == "yolo":
         return PredictionSample(paths[0], fused, None, {})
-    from D细化训练 import resize_fused
-    canvas, geometry = resize_fused(fused, imgsz)
-    height, width = fused.shape[:2]
+    if backend == "fusion":
+        canvas, geometry = letterbox_fused(fused, (height, imgsz))
+    else:
+        from D细化训练 import resize_fused
+        canvas, geometry = resize_fused(fused, imgsz)
+    original_height, width = fused.shape[:2]
     visible = np.ascontiguousarray(fused[:, :, :3][:, :, ::-1])
-    target = {"orig_size": torch.tensor([width, height]), "geometry": torch.tensor(geometry)}
+    target = {"orig_size": torch.tensor([width, original_height]),
+              "geometry": torch.tensor(geometry, dtype=torch.float64 if backend == "fusion" else torch.float32)}
     # 预取阶段只保留 uint8；归一化移到 GPU，减少 CPU 拷贝与传输体积。
     return PredictionSample(paths[0], np.ascontiguousarray(canvas.transpose(2, 0, 1)), visible, target)
 
@@ -287,7 +294,7 @@ def prediction_batches(samples: list[tuple[Path, Path, Path]], config: Predictio
     pending: deque[Future[PredictionSample]] = deque()
     capacity = config.batch * config.prefetch_batches
     for sample in paths:
-        pending.append(reader.submit(load_prediction_sample, sample, config.backend, config.imgsz))
+        pending.append(reader.submit(load_prediction_sample, sample, config.backend, config.imgsz, config.height))
         if len(pending) == capacity:
             break
     batch: list[PredictionSample] = []
@@ -295,13 +302,13 @@ def prediction_batches(samples: list[tuple[Path, Path, Path]], config: Predictio
         batch.append(pending.popleft().result())
         next_paths = next(paths, None)
         if next_paths is not None:
-            pending.append(reader.submit(load_prediction_sample, next_paths, config.backend, config.imgsz))
+            pending.append(reader.submit(load_prediction_sample, next_paths, config.backend, config.imgsz, config.height))
         if len(batch) == config.batch or not pending:
             yield batch
             batch = []
 
 
-def predict_batch(model: YOLO | DFinePredictor, batch: list[PredictionSample],
+def predict_batch(model: YOLO | DFinePredictor | FusionPredictor, batch: list[PredictionSample],
                   config: PredictionConfig) -> list[Results]:
     """只在主线程调用 GPU，将结果转回 CPU 后交给后台绘图线程。"""
     if config.backend == "yolo":
@@ -311,7 +318,10 @@ def predict_batch(model: YOLO | DFinePredictor, batch: list[PredictionSample],
     images = torch.from_numpy(np.stack([sample.image for sample in batch]))
     if config.pin_memory and model.device.type == "cuda":
         images = images.pin_memory()
-    predictions = model.predict_batch(images, [sample.target for sample in batch], config.conf, config.max_det)
+    if config.backend == "fusion":
+        predictions = model.predict_batch(images, [sample.target for sample in batch], config.conf, config.max_det, config.iou)
+    else:
+        predictions = model.predict_batch(images, [sample.target for sample in batch], config.conf, config.max_det)
     results: list[Results] = []
     for sample, prediction in zip(batch, predictions, strict=True):
         boxes = torch.cat((prediction["boxes"], prediction["scores"][:, None], prediction["labels"][:, None].float()), dim=1).cpu()
@@ -471,11 +481,11 @@ def parse_arguments(config: PredictionConfig, argv: list[str]) -> PredictionConf
     parser = argparse.ArgumentParser(description="三模态批量预测与赛事提交，默认值见 predict.py", argument_default=argparse.SUPPRESS)
     for name in ("weights", "source", "output"):
         parser.add_argument(f"--{name}", type=Path)
-    for name in ("imgsz", "batch", "workers", "save-workers", "prefetch-batches", "expected-count", "max-det", "png-compression", "log-every"):
+    for name in ("imgsz", "height", "batch", "workers", "save-workers", "prefetch-batches", "expected-count", "max-det", "png-compression", "log-every"):
         parser.add_argument(f"--{name}", type=int)
     for name in ("conf", "iou", "visual-conf"):
         parser.add_argument(f"--{name}", type=float)
-    parser.add_argument("--backend", choices=("auto", "yolo", "dfine"))
+    parser.add_argument("--backend", choices=("auto", "yolo", "dfine", "fusion"))
     parser.add_argument("--yolo-profile", choices=("v4", "current"), help="仅 YOLO：v4 逐张原生后处理，current 批量自定义后处理")
     parser.add_argument("--device", help="单张 GPU 编号或 cpu")
     parser.add_argument("--multi-label", action=argparse.BooleanOptionalAction, help="仅适用于 YOLO 的多标签 NMS")
@@ -504,8 +514,10 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
         raise ValueError("max_det 必须在 1–100，png_compression 必须在 0–9")
     if not all(0 <= value <= 1 for value in (config.conf, config.iou, config.visual_conf)):
         raise ValueError("conf、iou、visual_conf 必须位于 [0,1]")
-    if config.backend not in {"auto", "yolo", "dfine"}:
-        raise ValueError("backend 必须为 auto、yolo 或 dfine")
+    if config.backend not in {"auto", "yolo", "dfine", "fusion"}:
+        raise ValueError("backend 必须为 auto、yolo、dfine 或 fusion")
+    if config.height <= 0:
+        raise ValueError("height必须为正整数")
     if config.yolo_profile not in {"v4", "current"}:
         raise ValueError("yolo_profile 必须为 v4 或 current")
     weights, source, output = ((PROJECT_ROOT / path).resolve() for path in (config.weights, config.source, config.output))
@@ -533,8 +545,19 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             raise ValueError("v4 配方使用单标签；多标签预测须显式选择 --yolo-profile current")
         model = YOLO(str(weights), task="detect")
         validate_model(model)
-        print(f"YOLO 推理配方：{config.yolo_profile}；v4 使用逐张矩形填充及框架原生单标签 NMS" if config.yolo_profile == "v4"
-              else "YOLO 推理配方：current；同尺寸批量填充及自定义候选筛选")
+        if isinstance(model.model, FusionDetectionModel):
+            if config.multi_label:
+                raise ValueError("融合模型验证采用单标签NMS，不允许单独更改提交筛选方式")
+            backend = "fusion"
+            config = replace(config, backend=backend)
+            fusion_epoch = int(model.ckpt["epoch"]) + 1
+            model = FusionPredictor(model.model, config.device, (config.height, config.imgsz))
+            print(f"融合模型FP32批量预测：内容{config.imgsz}×{config.height}；张量高宽{canvas_shape(model.content_hw)}")
+        elif backend == "fusion":
+            raise ValueError("--backend fusion要求v9融合模型，不能用于历史五通道权重")
+        else:
+            print(f"YOLO 推理配方：{config.yolo_profile}；v4 使用逐张矩形填充及框架原生单标签 NMS" if config.yolo_profile == "v4"
+                  else "YOLO 推理配方：current；同尺寸批量填充及自定义候选筛选")
     prepare_output(output)
     print(f"预测权重：{weights}\n三模态配对完成，共 {len(samples)} 组；结果写入 {output}")
     model_batch = 1 if backend == "yolo" and config.yolo_profile == "v4" else config.batch
@@ -553,7 +576,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             for batch in prediction_batches(samples, config, reader):
                 groups: dict[tuple[int, ...], list[PredictionSample]] = {}
                 for sample in batch:
-                    # D-FINE 已统一为 5×1280×1280；YOLO 按原尺寸分组保留矩形填充。
+                    # 融合与D-FINE已统一各自画布；旧YOLO按原尺寸分组。
                     groups.setdefault(sample.image.shape, []).append(sample)
                 for group in groups.values():
                     results = predict_batch(model, group, config)
@@ -587,7 +610,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
         "visual_conf": config.visual_conf, "nms": True, "multi_label": config.multi_label, "max_det": config.max_det,
         "quantize": 32, "rect": True, "device": config.device, "batch": config.batch, "augment": False,
         "backend": backend, "workers": config.workers, "save_workers": config.save_workers,
-        "prefetch_batches": config.prefetch_batches, "pin_memory": config.pin_memory and backend == "dfine" and config.device != "cpu",
+        "prefetch_batches": config.prefetch_batches, "pin_memory": config.pin_memory and backend in {"dfine", "fusion"} and config.device != "cpu",
         "png_compression": config.png_compression, "actual_batch_sizes": dict(sorted(batch_sizes.items())),
         "pipeline_seconds": elapsed, "pipeline_images_per_second": len(samples) / elapsed,
     }
@@ -595,6 +618,13 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
         metadata.update({"dfine_commit": DFINE_COMMIT, "epoch": model.epoch, "nms": False,
                          "iou": None, "multi_label": None, "rect": False,
                          "postprocess": "native_query_class_topk", "preprocess": "square_letterbox_rgbirdepth_div255",
+                         "weights_kind": "ema"})
+    elif backend == "fusion":
+        metadata.update({"fusion_version": FUSION_VERSION, "content_hw": list(model.content_hw),
+                         "epoch": fusion_epoch,
+                         "tensor_hw": list(canvas_shape(model.content_hw)), "height": config.height,
+                         "yolo_profile": None, "postprocess": "shared_single_label_nms",
+                         "preprocess": "fixed_rectangle_rgbirdepth_div255", "effective_model_batch": config.batch,
                          "weights_kind": "ema"})
     else:
         metadata.update({"yolo_profile": config.yolo_profile,
