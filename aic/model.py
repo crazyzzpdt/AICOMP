@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 # 内置库
+import sys
 from copy import deepcopy
 from typing import Any
 
@@ -201,29 +202,5 @@ class FusionDetectionModel(DetectionModel):
         return FixedHeadLoss(self)
 
 
-class FusionPredictor:
-    """单次加载融合模型，对已矩形化的五通道批次执行 FP32 推理。"""
-
-    def __init__(self, model: FusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
-        if model.fusion_version != FUSION_VERSION or tuple(model.content_hw) != tuple(content_hw):
-            raise ValueError(f"权重要求版本 {getattr(model, 'fusion_version', None)}、高宽 {model.content_hw}，请同步预测参数")
-        self.device = torch.device("cpu" if str(device) == "cpu" else f"cuda:{int(device)}")
-        self.model = model.to(self.device).float().eval()
-        self.model.end2end = False
-        self.names = model.names
-        self.content_hw = content_hw
-
-    @torch.inference_mode()
-    def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
-                      conf: float, max_det: int, iou: float) -> list[dict[str, torch.Tensor]]:
-        """只做一次模型前向，用训练验证相同的NMS与原图坐标还原。"""
-        images = images.to(self.device, non_blocking=True).float().div_(255)
-        rows = single_label_nms(self.model(images), conf, iou, max_det)
-        outputs: list[dict[str, torch.Tensor]] = []
-        for row, target in zip(rows, targets, strict=True):
-            width, height = target["orig_size"].tolist()
-            geometry = tuple(target["geometry"].tolist())
-            boxes, keep = clip_canvas_boxes(row[:, :4], geometry, (height, width))
-            boxes = restore_boxes(boxes, geometry, (height, width))
-            outputs.append({"boxes": boxes, "scores": row[keep, 4], "labels": row[keep, 5].long()})
-        return outputs
+# 历史v9权重记录中文模块名；在入口加载权重前注册别名，不保留空壳转发文件。
+sys.modules.setdefault("三模态融合", sys.modules[__name__])

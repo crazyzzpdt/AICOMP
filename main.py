@@ -29,7 +29,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 from ultralytics import YOLO
 
 # 自己的模块
-from 融合训练 import FusionDetectionTrainer, FusionRecipe
+from aic.training import FusionDetectionTrainer, FusionRecipe
 
 
 # RGB主干和可迁移检测层来自官方COCO预训练，新增分支单独学习。
@@ -42,7 +42,7 @@ DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/mani
 PROJECT_PATH: str = "./runs/detect"
 RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1920x1080_v9_fusion"
 # 顺序为高、宽；原1920×1080不缩小，统一预处理仅补齐步长。
-IMAGE_HW: tuple[int, int] = (1080, 1920)
+IMAGE_HW: tuple[int, int] = (1920, 1080)
 # 120轮余弦收敛，第81轮完整画面收尾；不以5000轮间接控制双头损失。
 MAX_EPOCHS: int = 120
 POLISH_EPOCHS: int = 40
@@ -56,8 +56,8 @@ if __name__ == "__main__":
 
     # 融合扩展配置：原生YOLO只接受单个imgsz，矩形高宽由数据组件落实。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
-        image_height=IMAGE_HW[0],  # 内容高1080，张量仅补8像素，不拉伸目标
-        image_width=IMAGE_HW[1],  # 内容宽1920，与原生imgsz长边设置一致
+        image_height=IMAGE_HW[1],  # 内容高1080，张量仅补8像素，不拉伸目标
+        image_width=IMAGE_HW[0],  # 内容宽1920，与原生imgsz长边设置一致
         backbone_lr=0.00002,  # RGB主干慢学，保护预训练特征
         auxiliary_lr=0.0002,  # 新IR/Depth编码器和门控使用较高学习率
         val_batch=1,  # 轮末FP32验证，减少峰值显存

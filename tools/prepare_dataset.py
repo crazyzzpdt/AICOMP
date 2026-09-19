@@ -5,35 +5,23 @@ v8 使用 --audit-v8 导出来源审计，--review-v8 导出弱类审阅图；
 仅在 split_plan.json 已审阅后用 --apply-v8 落位，并完整备份旧划分。
 重新官方下载后使用 --refresh-official，保留现有划分，比较全部来源并重建副本。
 正式训练由 main.py 启动，原始数据不修改。
+在项目根目录执行：uv run python -m tools.prepare_dataset
 """
 
 # 内置库
 import argparse
 from collections import Counter
 from datetime import datetime
-import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
 
+# 自己的模块：以模块方式运行，避免工具脚本修改sys.path。
+from aic.data import CLASS_NAMES, IMAGE_SUFFIXES, file_hash
 
-IMAGE_SUFFIXES: frozenset[str] = frozenset({".jpg", ".jpeg", ".png"})
-CLASS_NAMES: tuple[str, ...] = (
-    "person",
-    "boat",
-    "animal",
-    "seat",
-    "sign",
-    "bicycle",
-    "car",
-    "ball",
-    "light",
-    "garbage can",
-    "uav",
-    "tricycle",
-)
+
 # 忽略小数舍入量级误差，只裁剪超出归一化边界万分之一的可见框。
 BOUNDARY_TOLERANCE: float = 0.0001
 # 2026-09-17 对原图审阅确认：大客车误标 person；仅对完全匹配的官方原行修订。
@@ -98,12 +86,6 @@ def clean_label_text(text: str) -> tuple[str, list[dict[str, object]]]:
         else:
             output.append(line)
     return ("\n".join(output) + "\n" if changes and output else text), changes
-
-
-def file_hash(path: Path) -> str:
-    """计算文件内容指纹，用于审计和恢复校验。"""
-    with path.open("rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def inspect_cleaning(dataset: Path, raw: Path, official_labels: Path) -> list[dict[str, object]]:
@@ -445,7 +427,7 @@ def apply_v8(dataset: Path, raw: Path, official_labels: Path, report: Path) -> N
         先核对源指纹，再构建完整暂存目录；只移动明确的 train/val 子目录。
         移动失败会回滚已切换目录，所有中间文件保留，不修改官方图像。
     """
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     dataset, report = dataset.resolve(), report.resolve()
     if dataset != root / "datasets" or not report.is_relative_to(root / "runs/dataset_cleaning"):
         raise ValueError("v8 落位仅允许本项目 datasets 与 runs/dataset_cleaning 内的审计目录")
@@ -548,7 +530,7 @@ def refresh_official_dataset(dataset: Path, raw: Path, official_labels: Path) ->
     """
     from PIL import Image
 
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parents[1]
     dataset = dataset.resolve()
     if dataset != root / "datasets":
         raise ValueError("官方刷新仅允许项目 datasets 目录")
@@ -667,7 +649,7 @@ def main() -> None:
     parser.add_argument("--apply-v8", type=Path, help="应用审阅目录中的 split_plan.json，整份旧划分搬入备份")
     parser.add_argument("--review-v8", type=Path, help="从已有审计导出弱类场景及标注，不运行模型")
     args = parser.parse_args()
-    project_root = Path(__file__).resolve().parent
+    project_root = Path(__file__).resolve().parents[1]
     dataset = project_root / "datasets"
     raw = project_root / "数据集" / "训练集" / "AIC2026_Train_2000"
     official_labels = project_root / "数据集" / "训练集" / "new_labels_2000"

@@ -18,6 +18,7 @@ import sys
 from contextlib import redirect_stdout, redirect_stderr
 from copy import copy, deepcopy
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -27,20 +28,173 @@ import numpy as np
 import torch
 import ultralytics
 from ultralytics.data.augment import Compose
+from ultralytics.data.build import InfiniteDataLoader, seed_worker
+from ultralytics.data.dataset import YOLODataset
+from ultralytics.data.utils import get_hash
+from ultralytics.models.yolo.detect.train import DetectionTrainer
 from ultralytics.models.yolo.detect.val import DetectionValidator
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import DetMetrics
 from ultralytics.utils.torch_utils import unwrap_model
 
 # 自己的模块
-from 三模态训练 import MultimodalDetectionTrainer, MultimodalYOLODataset
-from 三模态融合 import (FUSION_VERSION, FusionDetectionModel,
+from .model import (FUSION_VERSION, FusionDetectionModel,
                        canvas_shape, clip_canvas_boxes, letterbox_fused, single_label_nms)
-from 准备三模态数据集 import CLASS_NAMES, IMAGE_SUFFIXES, file_hash
+from .data import CLASS_NAMES, IMAGE_SUFFIXES, file_hash, fuse_modalities
 
 
 # 收尾至少完成二十轮后才允许早停；主权重始终按任何真实 AP95 新高保存。
 MIN_POLISH_EPOCHS: int = 20
+
+
+# 每进程有限缓存；学习率周期保持整理前的计算方式。
+IMAGE_BUFFER_LIMIT: int = 8
+LR_DECAY_EPOCHS: int = 200
+# 内部包迁移后仍以仓库根目录查找入口与审计。
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+
+
+def resolve_modality_directory(data: dict[str, object], modality: str, img_path: str) -> Path:
+    """解析各拆分的本地模态目录，同时兼容历史共享目录配置。"""
+    root = Path(str(data.get("path", Path.cwd()))).resolve()
+    configured = data[modality]
+    if isinstance(configured, dict):
+        split = Path(img_path).resolve().parent.name
+        if split not in configured:
+            raise ValueError(f"模态 {modality} 没有拆分 {split} 的路径")
+        configured = configured[split]
+    return (root / str(configured)).resolve()
+
+
+class MultimodalYOLODataset(YOLODataset):
+    """读取同名 RGB、红外、深度图并交给 Ultralytics 检测增强流程。"""
+
+    def __init__(self, *args: object, data: dict[str, object], **kwargs: object) -> None:
+        """初始化模态根目录后构建 YOLO 标签数据集。
+
+        Args:
+            args: 传递给 Ultralytics YOLODataset 的位置参数。
+            data: 含 ``infrared``、``depth`` 与 ``channels: 5`` 的数据集配置。
+            kwargs: 传递给 Ultralytics YOLODataset 的关键字参数。
+
+        Raises:
+            KeyError: 数据集配置缺少三模态目录。
+            ValueError: 数据集通道数不是五。
+        """
+        if data.get("channels") != 5:
+            raise ValueError("三模态早期融合训练的数据集 channels 必须为 5")
+        img_path = str(kwargs.get("img_path", args[0] if args else ""))
+        self.infrared_dir = resolve_modality_directory(data, "infrared", img_path)
+        self.depth_dir = resolve_modality_directory(data, "depth", img_path)
+        if not self.infrared_dir.is_dir() or not self.depth_dir.is_dir():
+            raise FileNotFoundError("红外或深度图目录不存在，请检查 datasets/data.yaml")
+        super().__init__(*args, data=data, **kwargs)
+        self.max_buffer_length = min(self.max_buffer_length, IMAGE_BUFFER_LIMIT)
+
+    def get_label_files(self) -> list[str]:
+        """建立可见光图、红外图、深度图与新版标签的同名映射。"""
+        label_files = super().get_label_files()
+        self.infrared_files = [self.infrared_dir / Path(image_path).name for image_path in self.im_files]
+        self.depth_files = [self.depth_dir / Path(image_path).name for image_path in self.im_files]
+        for modality_path, description in (
+            *[(path, "红外图") for path in self.infrared_files],
+            *[(path, "深度图") for path in self.depth_files],
+        ):
+            if not modality_path.is_file():
+                raise FileNotFoundError(f"{description}缺失，无法构成三模态样本：{modality_path}")
+        return label_files
+
+    def get_cache_hash(self) -> str:
+        """让标签缓存随任一模态文件变化而失效。"""
+        files = self.label_files + self.im_files + [str(path) for path in self.infrared_files + self.depth_files]
+        files.append(f"fusion-v2-classes-{','.join(map(str, self.data['names'].values()))}")
+        return get_hash(files)
+
+    def load_fused_image(self, index: int) -> np.ndarray:
+        """读取索引对应的原始尺寸五通道图像。"""
+        visible_path = Path(self.im_files[index])
+        return fuse_modalities(
+            visible_path,
+            self.infrared_dir / visible_path.name,
+            self.depth_dir / visible_path.name,
+        )
+
+    def cache_images_to_disk(self, index: int) -> None:
+        """将五通道融合图写入 NPY 缓存，避免后续反复解码三个源文件。"""
+        cache_path = self.npy_files[index]
+        if cache_path.exists() and not self.cache_is_current(index):
+            cache_path.unlink()
+        if not cache_path.exists():
+            try:
+                np.save(cache_path.as_posix(), self.load_fused_image(index), allow_pickle=False)
+            except Exception as error:
+                cache_path.unlink(missing_ok=True)
+                LOGGER.warning(f"{self.prefix}无法缓存三模态图像 {cache_path}：{error}")
+
+    def cache_is_current(self, index: int) -> bool:
+        """源图或融合实现更新后重新生成缓存，避免复用旧 BGR 输入。"""
+        visible_path = Path(self.im_files[index])
+        sources = (visible_path, self.infrared_dir / visible_path.name, self.depth_dir / visible_path.name, Path(__file__))
+        cache_path = self.npy_files[index]
+        return cache_path.is_file() and cache_path.stat().st_mtime_ns >= max(path.stat().st_mtime_ns for path in sources)
+
+    def load_image(
+        self, index: int, rect_mode: bool = True, resize_short: bool = False
+    ) -> tuple[np.ndarray, tuple[int, int], tuple[int, int]]:
+        """加载五通道图像，并保持 Ultralytics 的原始缩放和缓存语义。"""
+        image, cache_path = self.ims[index], self.npy_files[index]
+        if image is None:
+            if self.cache_is_current(index):
+                try:
+                    image = np.load(cache_path, allow_pickle=False)
+                    if image.ndim != 3 or image.shape[2] != 5:
+                        raise ValueError(f"缓存通道数为 {image.shape[-1] if image.ndim >= 3 else 1}，期望为 5")
+                except Exception as error:
+                    LOGGER.warning(f"{self.prefix}移除失效三模态缓存 {cache_path}：{error}")
+                    cache_path.unlink(missing_ok=True)
+                    image = self.load_fused_image(index)
+            else:
+                image = self.load_fused_image(index)
+
+            height_original, width_original = image.shape[:2]
+            if rect_mode:
+                if resize_short:
+                    ratio = self.imgsz / min(height_original, width_original)
+                    if ratio != 1:
+                        width, height = (
+                            (math.ceil(width_original * ratio), self.imgsz)
+                            if height_original < width_original
+                            else (self.imgsz, math.ceil(height_original * ratio))
+                        )
+                        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+                else:
+                    ratio = self.imgsz / max(height_original, width_original)
+                    if ratio != 1:
+                        width = min(math.ceil(width_original * ratio), self.imgsz)
+                        height = min(math.ceil(height_original * ratio), self.imgsz)
+                        image = cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR)
+            elif not (height_original == width_original == self.imgsz):
+                image = cv2.resize(image, (self.imgsz, self.imgsz), interpolation=cv2.INTER_LINEAR)
+
+            if self.augment and self.cache != "ram":
+                self.ims[index] = image
+                self.im_hw0[index] = (height_original, width_original)
+                self.im_hw[index] = image.shape[:2]
+                self.buffer.append(index)
+                if 1 < len(self.buffer) >= self.max_buffer_length:
+                    old_index = self.buffer.pop(0)
+                    if self.cache != "ram":
+                        self.ims[old_index], self.im_hw0[old_index], self.im_hw[old_index] = None, None, None
+
+            return image, (height_original, width_original), image.shape[:2]
+        return image, self.im_hw0[index], self.im_hw[index]
+
+
+def learning_rate_factor(epoch: int, decay_epochs: int, final_ratio: float, cosine: bool) -> float:
+    """按独立收敛周期衰减学习率，到达下限后保持不反弹。"""
+    progress: float = min(max(epoch / max(decay_epochs, 1), 0.0), 1.0)
+    remaining: float = (1.0 + math.cos(math.pi * progress)) / 2.0 if cosine else 1.0 - progress
+    return final_ratio + (1.0 - final_ratio) * remaining
 
 
 @dataclass(frozen=True)
@@ -257,7 +411,7 @@ class LogStream:
         return self.console.isatty()
 
 
-class FusionDetectionTrainer(MultimodalDetectionTrainer):
+class FusionDetectionTrainer(DetectionTrainer):
     """沿用原生YOLO训练循环，显式配置融合结构、矩形数据与指标记录。"""
 
     def __init__(self, *args: Any, recipe: FusionRecipe, **kwargs: Any) -> None:
@@ -353,8 +507,49 @@ class FusionDetectionTrainer(MultimodalDetectionTrainer):
                                   content_hw=(self.recipe.image_height, self.recipe.image_width),
                                   audit_digest=self.audit["manifest_sha256"])
 
-    def get_dataloader(self, dataset_path: str, batch_size: int = 16, rank: int = -1, mode: str = "train") -> Any:
-        return super().get_dataloader(dataset_path, self.recipe.val_batch if mode == "val" else batch_size, rank, mode)
+    # 框架生命周期方法名必须与父类一致。
+    def _setup_scheduler(self) -> None:
+        """保留训练轮数上限，将实际学习率衰减限制在前 200 轮。"""
+        self.lf = partial(
+            learning_rate_factor,
+            decay_epochs=min(self.epochs, LR_DECAY_EPOCHS),
+            final_ratio=self.args.lrf,
+            cosine=self.args.cos_lr,
+        )
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
+
+    def get_dataloader(
+        self, dataset_path: str, batch_size: int = 16, rank: int = -1, mode: str = "train"
+    ) -> InfiniteDataLoader:
+        """为本机单卡构建低预取加载器，验证进程数不再翻倍。
+
+        Note:
+            五通道增强曾出现 CPU 内存分配失败，因此每个进程仅预取一批，关闭锁页。
+            当前实现限定单卡训练；Windows 多进程入口仍由 main.py 保护。
+        """
+        if rank != -1:
+            raise ValueError("当前三模态加载器面向本机单卡，请使用 device=0")
+        if mode not in {"train", "val"}:
+            raise ValueError(f"不支持的数据加载模式：{mode}")
+        batch_size = self.recipe.val_batch if mode == "val" else batch_size
+        dataset = self.build_dataset(dataset_path, mode, batch_size)
+        batch_size = min(batch_size, len(dataset))
+        shuffle: bool = mode == "train" and not dataset.rect
+        workers: int = min(self.args.workers, math.ceil(len(dataset) / batch_size))
+        generator = torch.Generator().manual_seed(self.args.seed)
+        LOGGER.info(f"{mode}: 加载进程 {workers}，每进程预取 1 批，锁页内存关闭")
+        return InfiniteDataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=workers,
+            prefetch_factor=1 if workers else None,
+            pin_memory=False,
+            collate_fn=dataset.collate_fn,
+            worker_init_fn=seed_worker,
+            generator=generator,
+            drop_last=bool(self.args.compile and mode == "train"),
+        )
 
     def build_optimizer(self, model: torch.nn.Module, name: str = "AdamW", lr: float = 0.001,
                         momentum: float = 0.9, decay: float = 1e-5, iterations: float = 1e5) -> torch.optim.Optimizer:
@@ -379,9 +574,9 @@ class FusionDetectionTrainer(MultimodalDetectionTrainer):
     def _setup_train(self) -> None:
         super()._setup_train()
         self.stopper = PolishEarlyStopping(self.epochs - self.args.close_mosaic + 1, self.args.patience, self.recipe.min_delta)
-        files = ("main.py", "三模态融合.py", "融合训练.py", "三模态训练.py", "准备三模态数据集.py")
+        files = ("main.py", "aic/__init__.py", "aic/model.py", "aic/training.py", "aic/data.py")
         # main.py允许只改RESUME_PATH和资源参数，配方本身另行比较；组件源码不可偷偷变化。
-        sources = {name: file_hash(Path(__file__).parent / name) for name in files if name != "main.py"}
+        sources = {name: file_hash(PROJECT_ROOT / name) for name in files if name != "main.py"}
         package = Path(ultralytics.__file__).parent
         framework = {"ultralytics": ultralytics.__version__, "torch": str(torch.__version__),
                      "files": {name: file_hash(package / name) for name in (
@@ -413,7 +608,9 @@ class FusionDetectionTrainer(MultimodalDetectionTrainer):
         code = self.save_dir / "code"
         code.mkdir(exist_ok=True)
         for name in files:
-            shutil.copy2(Path(__file__).parent / name, code / name)
+            destination = code / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(PROJECT_ROOT / name, destination)
         LOGGER.info(f"融合输入：内容1920×1080，张量1920×1088；物理批次{self.batch_size}，有效批次{self.args.nbs}")
 
     def optimizer_step(self) -> None:
