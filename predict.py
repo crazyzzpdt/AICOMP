@@ -52,18 +52,18 @@ from ultralytics.utils import nms, ops
 
 # 自己的模块
 from aic.data import CLASS_NAMES, IMAGE_SUFFIXES, fuse_modalities
-from aic.model import (FUSION_VERSION, FusionDetectionModel, canvas_shape, clip_canvas_boxes,
+from aic.model import (EARLY_FUSION_VERSION, FUSION_VERSION, EarlyFusionDetectionModel, FusionDetectionModel, canvas_shape, clip_canvas_boxes,
                        letterbox_fused, restore_boxes, single_label_nms)
 
 
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-# 本轮训练完成后使用v9 AP95最佳权重；同名训练递增目录须填写实际路径。
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1920x1080_v9_fusion/weights/best.pt"
+# v13训练结束后使用AP95最佳权重；旧模型可通过--weights显式指定，不覆盖产物。
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v13_native_full/weights/best.pt"
 # 官方初赛的同名 visible、infrared、depth 三模态图像。
 SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。
-OUTPUT_PATH: Path = PROJECT_ROOT / "predict_v9"
+OUTPUT_PATH: Path = PROJECT_ROOT / "predict_v13"
 
 
 # 赛事规定单图最多100框，所有后端统一截断。
@@ -119,14 +119,19 @@ class PredictionSample:
 class FusionPredictor:
     """单次加载融合模型，对已矩形化的五通道批次执行 FP32 推理。"""
 
-    def __init__(self, model: FusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
-        if model.fusion_version != FUSION_VERSION or tuple(model.content_hw) != tuple(content_hw):
-            raise ValueError(f"权重要求版本 {getattr(model, 'fusion_version', None)}、高宽 {model.content_hw}，请同步预测参数")
+    def __init__(self, model: FusionDetectionModel | EarlyFusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
+        early = isinstance(model, EarlyFusionDetectionModel)
+        version = getattr(model, "early_fusion_version" if early else "fusion_version", None)
+        expected = EARLY_FUSION_VERSION if early else FUSION_VERSION
+        if version != expected or tuple(getattr(model, "content_hw", ())) != tuple(content_hw):
+            raise ValueError(f"权重版本{version}、高宽{getattr(model, 'content_hw', None)}不匹配；请使用对应源码和预测尺寸")
         self.device = torch.device("cpu" if str(device) == "cpu" else f"cuda:{int(device)}")
         self.model = model.to(self.device).float().eval()
         self.model.end2end = False
         self.names = model.names
         self.content_hw = content_hw
+        self.version = version
+        self.architecture = "early_fusion" if early else "gated_fusion"
 
     @torch.inference_mode()
     def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
@@ -420,7 +425,7 @@ def predict_yolo_batch(model: YOLO, images: list[np.ndarray], config: Prediction
         predictor=partial(predictor_class, multi_label=config.multi_label),  # v4 恢复原生后处理，current 保留可选自定义候选
         # 一、输入、检测与精度
         source=images[0] if legacy else images,  # v4 与历史代码一致传原尺寸单张数组
-        imgsz=config.imgsz,  # 默认 1280，与训练验证分辨率一致
+        imgsz=config.imgsz,  # 历史YOLO须显式填写其训练尺度，例如v4为1280
         rect=True,  # 按相同原尺寸分组，避免混合尺寸批次退化为正方形填充
         conf=config.conf,  # 默认 0.001，为 AP 评测保留低分候选
         iou=config.iou,  # 默认 0.7，与训练验证的 NMS 一致
@@ -740,7 +745,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             raise ValueError("v4 配方使用单标签；多标签预测须显式选择 --yolo-profile current")
         model = YOLO(str(weights), task="detect")
         validate_model(model)
-        if isinstance(model.model, FusionDetectionModel):
+        if isinstance(model.model, (FusionDetectionModel, EarlyFusionDetectionModel)):
             if config.multi_label:
                 raise ValueError("融合模型验证采用单标签NMS，不允许单独更改提交筛选方式")
             backend = "fusion"
@@ -749,7 +754,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             model = FusionPredictor(model.model, config.device, (config.height, config.imgsz))
             print(f"融合模型FP32批量预测：内容{config.imgsz}×{config.height}；张量高宽{canvas_shape(model.content_hw)}")
         elif backend == "fusion":
-            raise ValueError("--backend fusion要求v9融合模型，不能用于历史五通道权重")
+            raise ValueError("--backend fusion要求带项目几何元数据的v9及后续模型，不能用于历史v4五通道权重")
         else:
             print(f"YOLO 推理配方：{config.yolo_profile}；v4 使用逐张矩形填充及框架原生单标签 NMS" if config.yolo_profile == "v4"
                   else "YOLO 推理配方：current；同尺寸批量填充及自定义候选筛选")
@@ -815,7 +820,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                          "postprocess": "native_query_class_topk", "preprocess": "square_letterbox_rgbirdepth_div255",
                          "weights_kind": "ema"})
     elif backend == "fusion":
-        metadata.update({"fusion_version": FUSION_VERSION, "content_hw": list(model.content_hw),
+        metadata.update({"fusion_version": model.version, "architecture": model.architecture, "content_hw": list(model.content_hw),
                          "epoch": fusion_epoch,
                          "tensor_hw": list(canvas_shape(model.content_hw)), "height": config.height,
                          "yolo_profile": None, "postprocess": "shared_single_label_nms",
@@ -844,9 +849,9 @@ if __name__ == "__main__":
         expected_count=1000,  # 已确认初赛为 1000 组，仅核对文件清单避免交错目录
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
-        imgsz=1920,  # 与v9训练一致的内容宽度，原1920宽图片不先缩到1280
-        height=1080,  # 内容高度1080；网络画布仅补齐到1088，不拉伸
-        batch=4,  # 全尺寸新结构FP32批量起点，由用户调整，不自动探测
+        imgsz=1280,  # 与v13原生方形训练尺度一致
+        height=1280,  # FusionPredictor据此构造1280×1280画布
+        batch=4,  # FP32矩形批量推理，用户可按显存调整；本轮未实测峰值
         workers=8,  # 并行解码三模态并提前缩放，给 GPU 连续准备输入
         save_workers=8,  # 后台画框、编码和写文件，不再逐张阻塞下一次推理
         prefetch_batches=2,  # 全尺寸图片预取2批，控制五通道与待保存原图内存
@@ -855,10 +860,10 @@ if __name__ == "__main__":
 
         # 三、检测候选与后处理：保持比赛口径，不用降低精度换速度
         conf=0.001,  # 保留低分候选计算 AP，与验证一致，不是图片展示阈值
-        iou=0.7,  # v9与轮末验证共享单标签NMS；D-FINE仍忽略此参数
+        iou=0.7,  # v9/v10与轮末验证共享单标签NMS；D-FINE仍忽略此参数
         max_det=100,  # 赛事每图最多 100 框，按置信度保留，不做多模型集成
         multi_label=False,  # YOLO 默认单标签；D-FINE 原生查询类别排序不受此开关控制
-        yolo_profile="v4",  # 仅用于旧YOLO；v9自动采用训练共用的矩形批量后端
+        yolo_profile="v4",  # 仅用于历史YOLO；v10自动识别并使用训练共用矩形/NMS批量路径
 
         # 四、可视化与进度：只影响输出耗时和图片，不改提交预测框
         visual_conf=0.25,  # 仅绘制较高置信度框，六列 TXT 仍保留 conf 以上候选

@@ -1,4 +1,4 @@
-"""提供 YOLO26l 三分支门控融合与训练、预测共用的矩形预处理。
+"""提供YOLO26l五通道早期融合、历史门控结构及共用几何处理。
 
 模型类别保持可导入，保证本地检查点在 Windows 子进程与 predict.py 中恢复。
 只有正式训练或预测入口会执行前向，本模块导入不加载权重或启动训练。
@@ -23,6 +23,8 @@ from ultralytics.utils.loss import E2ELoss
 
 # 结构和预处理共同版本化，不把旧五通道首层模型当作新分支模型。
 FUSION_VERSION: str = "yolo26l_gated_rect_v9_1"
+# 全尺寸v10与上一版1280候选区分，禁止预测时静默混用预处理。
+EARLY_FUSION_VERSION: str = "yolo26l_early_rect_v10_2"
 # 五通道顺序沿用已有数据集；真实内容框宽高与网络补齐画布分别记录。
 DEFAULT_CONTENT_HW: tuple[int, int] = (1080, 1920)
 # YOLO26l P3、P4、P5 在官方主干的层号，不改动其参数路径。
@@ -158,6 +160,25 @@ class FixedHeadLoss(E2ELoss):
         return many[0] * 0.8 + one[0] * 0.2, many[1]
 
 
+class EarlyFusionDetectionModel(DetectionModel):
+    """从第一层共同学习三模态，保留官方YOLO主干和双检测头。"""
+
+    def __init__(self, cfg: dict[str, Any], nc: int = 12, verbose: bool = True) -> None:
+        super().__init__(deepcopy(cfg), ch=5, nc=nc, verbose=verbose)
+        if self.yaml.get("scale") != "l" or len(self.model) != 24:
+            raise ValueError("v10配方使用官方YOLO26l，不自动换模型规模")
+        self.early_fusion_version = EARLY_FUSION_VERSION
+        self.content_hw = DEFAULT_CONTENT_HW
+        self.end2end = False
+        # 只在初始化时置零新增卷积切片，保护RGB迁移；不清零输入、不冻结辅助通道。
+        with torch.no_grad():
+            self.model[0].conv.weight[:, 3:].zero_()
+
+    def init_criterion(self) -> FixedHeadLoss:
+        """保持一对多头训练份额，避免缩短epochs后改变v4的实际双头配比。"""
+        return FixedHeadLoss(self)
+
+
 class FusionDetectionModel(DetectionModel):
     """保持原 YOLO26l RGB 参数路径，在颈部前融合 IR/Depth 特征。"""
 
@@ -174,14 +195,15 @@ class FusionDetectionModel(DetectionModel):
         self.yaml["channels"] = 5
         self.end2end = False
 
-    def _predict_once(self, x: torch.Tensor, profile: bool = False, visualize: bool = False,
+    def _predict_once(self, x: torch.Tensor, profile: bool = False,
                       embed: list[int] | None = None) -> Any:
         """RGB主干独立前向后替换颈部输入，辅助特征不污染后续RGB主干。"""
         # 父类构建时用三通道小张量推导步长，此时辅助分支尚未建立。
         if not hasattr(self, "ir_encoder"):
-            return super()._predict_once(x, profile, visualize, embed)
-        if x.shape[1] != 5 or embed is not None or profile or visualize:
-            raise ValueError("融合模型要求五通道常规前向，不支持 embed/profile/visualize")
+            # 本机Ultralytics接口为(x, profile, embed)，不再接受visualize参数。
+            return super()._predict_once(x, profile=profile, embed=embed)
+        if x.shape[1] != 5 or embed is not None or profile:
+            raise ValueError("融合模型要求五通道常规前向，不支持 embed/profile")
         infrared, depth = self.ir_encoder(x[:, 3:4]), self.depth_encoder(x[:, 4:5])
         x = x[:, :3]
         saved: list[Any] = []
