@@ -52,18 +52,19 @@ from ultralytics.utils import nms, ops
 
 # 自己的模块
 from aic.data import CLASS_NAMES, IMAGE_SUFFIXES, fuse_modalities
-from aic.model import (EARLY_FUSION_VERSION, FUSION_VERSION, EarlyFusionDetectionModel, FusionDetectionModel, canvas_shape, clip_canvas_boxes,
-                       letterbox_fused, restore_boxes, single_label_nms)
+from aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION,
+                       EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, canvas_shape, clip_canvas_boxes,
+                       letterbox_fused, letterbox_native_fused, restore_boxes, single_label_nms)
 
 
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-# v13训练结束后使用AP95最佳权重；旧模型可通过--weights显式指定，不覆盖产物。
+# 先重用已有v13最佳权重修正补边提交；v14训练完成后再显式指定其权重。
 MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v13_native_full/weights/best.pt"
 # 官方初赛的同名 visible、infrared、depth 三模态图像。
 SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。
-OUTPUT_PATH: Path = PROJECT_ROOT / "predict_v13"
+OUTPUT_PATH: Path = PROJECT_ROOT / "predict_v13_preprocess_fix"
 
 
 # 赛事规定单图最多100框，所有后端统一截断。
@@ -122,7 +123,8 @@ class FusionPredictor:
     def __init__(self, model: FusionDetectionModel | EarlyFusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
         early = isinstance(model, EarlyFusionDetectionModel)
         version = getattr(model, "early_fusion_version" if early else "fusion_version", None)
-        expected = EARLY_FUSION_VERSION if early else FUSION_VERSION
+        split_stem = early and isinstance(model.model[0], SplitModalStem)
+        expected = SPLIT_STEM_VERSION if split_stem else EARLY_FUSION_VERSION if early else FUSION_VERSION
         if version != expected or tuple(getattr(model, "content_hw", ())) != tuple(content_hw):
             raise ValueError(f"权重版本{version}、高宽{getattr(model, 'content_hw', None)}不匹配；请使用对应源码和预测尺寸")
         self.device = torch.device("cpu" if str(device) == "cpu" else f"cuda:{int(device)}")
@@ -131,7 +133,13 @@ class FusionPredictor:
         self.names = model.names
         self.content_hw = content_hw
         self.version = version
-        self.architecture = "early_fusion" if early else "gated_fusion"
+        self.architecture = "split_stem_v18" if split_stem else "early_fusion" if early else "gated_fusion"
+        recipe = getattr(model, "fusion_training", {}).get("signature", {}).get("recipe", {})
+        self.geometry = recipe.get("geometry", "fixed_rect")
+        if self.geometry not in {"native_square", "fixed_rect"}:
+            raise ValueError(f"未知的训练预处理几何：{self.geometry}")
+        if self.geometry == "native_square" and content_hw[0] != content_hw[1]:
+            raise ValueError("原生方形权重要求height与imgsz一致")
 
     @torch.inference_mode()
     def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
@@ -338,7 +346,11 @@ def validate_model(model: YOLO) -> None:
         ValueError: 任务、首层通道数或类别编号不符。
     """
     first_conv = next((layer for layer in model.model.modules() if isinstance(layer, torch.nn.Conv2d)), None)
-    if model.task != "detect" or first_conv is None or (first_conv.in_channels != 5 and not isinstance(model.model, FusionDetectionModel)):
+    split_stem = (isinstance(model.model, EarlyFusionDetectionModel) and
+                  getattr(model.model, "early_fusion_version", None) == SPLIT_STEM_VERSION and
+                  isinstance(model.model.model[0], SplitModalStem))
+    if model.task != "detect" or first_conv is None or (
+            first_conv.in_channels != 5 and not isinstance(model.model, FusionDetectionModel) and not split_stem):
         raise ValueError("必须使用训练后的五通道检测权重，不能使用 orgin_models 中的 RGB 预训练权重")
     if model.names != dict(enumerate(CLASS_NAMES)):
         raise ValueError(f"模型类别编号与比赛 12 类不一致：{model.names}")
@@ -469,7 +481,8 @@ def predict_yolo_batch(model: YOLO, images: list[np.ndarray], config: Prediction
     return results
 
 
-def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: int, height: int = 1080) -> PredictionSample:
+def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: int, height: int = 1080,
+                           fusion_geometry: str = "fixed_rect") -> PredictionSample:
     """在读取线程中融合模态，并完成相应后端的同步缩放与填充。"""
     fused = fuse_modalities(*paths)
     if fused.dtype != np.uint8 or fused.ndim != 3 or fused.shape[2] != 5:
@@ -477,7 +490,8 @@ def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: 
     if backend == "yolo":
         return PredictionSample(paths[0], fused, None, {})
     if backend == "fusion":
-        canvas, geometry = letterbox_fused(fused, (height, imgsz))
+        canvas, geometry = (letterbox_native_fused(fused, imgsz) if fusion_geometry == "native_square"
+                            else letterbox_fused(fused, (height, imgsz)))
     else:
         canvas, geometry = resize_dfine_fused(fused, imgsz)
     original_height, width = fused.shape[:2]
@@ -489,13 +503,13 @@ def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: 
 
 
 def prediction_batches(samples: list[tuple[Path, Path, Path]], config: PredictionConfig,
-                       reader: ThreadPoolExecutor) -> Iterator[list[PredictionSample]]:
+                       reader: ThreadPoolExecutor, fusion_geometry: str = "fixed_rect") -> Iterator[list[PredictionSample]]:
     """并行预读有限窗口并按清单顺序成批返回，读取异常直接交给主线程。"""
     paths = iter(samples)
     pending: deque[Future[PredictionSample]] = deque()
     capacity = config.batch * config.prefetch_batches
     for sample in paths:
-        pending.append(reader.submit(load_prediction_sample, sample, config.backend, config.imgsz, config.height))
+        pending.append(reader.submit(load_prediction_sample, sample, config.backend, config.imgsz, config.height, fusion_geometry))
         if len(pending) == capacity:
             break
     batch: list[PredictionSample] = []
@@ -503,7 +517,7 @@ def prediction_batches(samples: list[tuple[Path, Path, Path]], config: Predictio
         batch.append(pending.popleft().result())
         next_paths = next(paths, None)
         if next_paths is not None:
-            pending.append(reader.submit(load_prediction_sample, next_paths, config.backend, config.imgsz, config.height))
+            pending.append(reader.submit(load_prediction_sample, next_paths, config.backend, config.imgsz, config.height, fusion_geometry))
         if len(batch) == config.batch or not pending:
             yield batch
             batch = []
@@ -753,6 +767,8 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             fusion_epoch = int(model.ckpt["epoch"]) + 1
             model = FusionPredictor(model.model, config.device, (config.height, config.imgsz))
             print(f"融合模型FP32批量预测：内容{config.imgsz}×{config.height}；张量高宽{canvas_shape(model.content_hw)}")
+            print(f"检查点预处理：{model.geometry}；五通道补边="
+                  f"{[114] * 5 if model.geometry == 'native_square' else [114, 114, 114, 0, 0]}")
         elif backend == "fusion":
             raise ValueError("--backend fusion要求带项目几何元数据的v9及后续模型，不能用于历史v4五通道权重")
         else:
@@ -773,7 +789,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
     try:
         with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="模态读取") as reader, \
                 ThreadPoolExecutor(max_workers=config.save_workers, thread_name_prefix="结果保存") as writer:
-            for batch in prediction_batches(samples, config, reader):
+            for batch in prediction_batches(samples, config, reader, getattr(model, "geometry", "fixed_rect")):
                 groups: dict[tuple[int, ...], list[PredictionSample]] = {}
                 for sample in batch:
                     # 融合与D-FINE已统一各自画布；旧YOLO按原尺寸分组。
@@ -821,10 +837,14 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                          "weights_kind": "ema"})
     elif backend == "fusion":
         metadata.update({"fusion_version": model.version, "architecture": model.architecture, "content_hw": list(model.content_hw),
+                         "evaluation_protocol": EVALUATION_PROTOCOL,
                          "epoch": fusion_epoch,
                          "tensor_hw": list(canvas_shape(model.content_hw)), "height": config.height,
                          "yolo_profile": None, "postprocess": "shared_single_label_nms",
-                         "preprocess": "fixed_rectangle_rgbirdepth_div255", "effective_model_batch": config.batch,
+                         "rect": False, "validation_geometry": model.geometry,
+                         "padding_values": [114] * 5 if model.geometry == "native_square" else [114, 114, 114, 0, 0],
+                         "preprocess": "native_square_ceil_pad114_div255_v1" if model.geometry == "native_square" else "fixed_rectangle_rgbirdepth_div255",
+                         "effective_model_batch": config.batch,
                          "weights_kind": "ema"})
     else:
         metadata.update({"yolo_profile": config.yolo_profile,
@@ -842,7 +862,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
 if __name__ == "__main__":
     predict(PredictionConfig(
         # 一、模型、数据与输出
-        weights=MODEL_PATH,  # v9训练完成后使用同一训练轨迹的EMA最佳模型
+        weights=MODEL_PATH,  # 先重用v13已有EMA最佳，不必为修正预测补边重新训练
         source=SOURCE_PATH,  # 只读官方三模态图像，不生成缓存或修改原始文件
         output=OUTPUT_PATH,  # 保存带框图片、六列标签和提交 ZIP，已有目录不覆盖
         backend="auto",  # 从检查点识别融合结构；仍兼容旧YOLO和D-FINE
@@ -860,10 +880,10 @@ if __name__ == "__main__":
 
         # 三、检测候选与后处理：保持比赛口径，不用降低精度换速度
         conf=0.001,  # 保留低分候选计算 AP，与验证一致，不是图片展示阈值
-        iou=0.7,  # v9/v10与轮末验证共享单标签NMS；D-FINE仍忽略此参数
+        iou=0.7,  # 与轮末验证共享单标签NMS；D-FINE仍忽略此参数
         max_det=100,  # 赛事每图最多 100 框，按置信度保留，不做多模型集成
         multi_label=False,  # YOLO 默认单标签；D-FINE 原生查询类别排序不受此开关控制
-        yolo_profile="v4",  # 仅用于历史YOLO；v10自动识别并使用训练共用矩形/NMS批量路径
+        yolo_profile="v4",  # 仅用于历史YOLO；v9之后按权重几何选择补边，不强制套用v4
 
         # 四、可视化与进度：只影响输出耗时和图片，不改提交预测框
         visual_conf=0.25,  # 仅绘制较高置信度框，六列 TXT 仍保留 conf 以上候选

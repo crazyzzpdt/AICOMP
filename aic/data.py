@@ -35,6 +35,25 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
+def verify_source_images(root: Path, samples: list[dict[str, object]]) -> None:
+    """核对审计中的三模态内容指纹，拒绝同名文件被静默替换。
+
+    Args:
+        root: 含 train/val 的数据根目录。
+        samples: 已落位审计的样本记录，必须包含官方来源哈希。
+
+    Raises:
+        ValueError: 记录缺少指纹，或图像内容与已审阅来源不同。
+    """
+    for sample in samples:
+        hashes = sample.get("source_hashes", {})
+        for folder, modality in (("images", "visible"), ("infrared", "infrared"), ("depth", "depth")):
+            path = root / str(sample["after_split"]) / folder / str(sample["image"])
+            expected = hashes.get(modality)
+            if not expected or file_hash(path) != expected:
+                raise ValueError(f"三模态来源指纹不一致或缺失：{modality}/{sample['image']}")
+
+
 def read_image(path: Path, flags: int) -> np.ndarray:
     """读取单张图像，并兼容 Windows 中文路径。
 

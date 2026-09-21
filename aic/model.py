@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import torch
 from torch import nn
+from ultralytics.data.augment import LetterBox
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import nms
 from ultralytics.utils.loss import E2ELoss
@@ -25,6 +26,10 @@ from ultralytics.utils.loss import E2ELoss
 FUSION_VERSION: str = "yolo26l_gated_rect_v9_1"
 # 全尺寸v10与上一版1280候选区分，禁止预测时静默混用预处理。
 EARLY_FUSION_VERSION: str = "yolo26l_early_rect_v10_2"
+# 首层参数路径改变，须与旧五通道整块卷积区分恢复。
+SPLIT_STEM_VERSION: str = "yolo26l_split_stem_v18_1"
+# 协议变化不冒充模型提升；新旧权重须在同一划分、同一协议下比较。
+EVALUATION_PROTOCOL: str = "fp32_single_label_content_clip_v2"
 # 五通道顺序沿用已有数据集；真实内容框宽高与网络补齐画布分别记录。
 DEFAULT_CONTENT_HW: tuple[int, int] = (1080, 1920)
 # YOLO26l P3、P4、P5 在官方主干的层号，不改动其参数路径。
@@ -42,6 +47,27 @@ def resize_channels(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     """逐通道缩放，避开 OpenCV 部分插值路径最多四通道的限制。"""
     return np.stack([cv2.resize(image[:, :, index], size_wh, interpolation=cv2.INTER_LINEAR)
                      for index in range(image.shape[2])], axis=-1)
+
+
+def resize_native_fused(image: np.ndarray, imgsz: int) -> np.ndarray:
+    """复用原生数据集的长边缩放及向上取整，训练和预测不各用一套取整规则。"""
+    height, width = image.shape[:2]
+    ratio = imgsz / max(height, width)
+    if ratio == 1:
+        return image
+    size = (min(int(np.ceil(width * ratio)), imgsz), min(int(np.ceil(height * ratio)), imgsz))
+    return resize_channels(image, size)
+
+
+def letterbox_native_fused(image: np.ndarray, imgsz: int) -> tuple[np.ndarray, tuple[float, float, int, int]]:
+    """按原生验证链缩放并对五通道全部填114，不混用固定矩形的辅助通道零补边。"""
+    if image.ndim != 3 or image.shape[2] != 5 or image.dtype != np.uint8:
+        raise ValueError("原生融合输入必须是 uint8 RGB3+IR1+Depth1")
+    height, width = image.shape[:2]
+    resized = resize_native_fused(image, imgsz)
+    new_height, new_width = resized.shape[:2]
+    canvas = LetterBox(new_shape=(imgsz, imgsz), auto=False, scaleup=False, padding_value=114)(image=resized)
+    return canvas, (new_width / width, new_height / height, (imgsz - new_width) // 2, (imgsz - new_height) // 2)
 
 
 def letterbox_fused(image: np.ndarray, content_hw: tuple[int, int]) -> tuple[np.ndarray, tuple[float, float, int, int]]:
@@ -160,6 +186,42 @@ class FixedHeadLoss(E2ELoss):
         return many[0] * 0.8 + one[0] * 0.2, many[1]
 
 
+class SplitModalStem(nn.Module):
+    """拆分首层可训练参数，在共享BN前相加，不增加辅助骨干。"""
+
+    def __init__(self, source: nn.Module) -> None:
+        super().__init__()
+        conv = source.conv
+        if conv.in_channels != 5 or conv.groups != 1 or conv.bias is not None:
+            raise ValueError("分模态首层要求五通道、groups=1且无偏置")
+        for name, start, stop in (("rgb", 0, 3), ("infrared", 3, 4), ("depth", 4, 5)):
+            # 不额外随机初始化，避免拆分动作推进全局随机状态。
+            branch = deepcopy(conv)
+            branch.in_channels = stop - start
+            branch.weight = nn.Parameter(conv.weight[:, start:stop].detach().clone())
+            setattr(self, name, branch)
+        self.bn, self.act = source.bn, source.act
+        for key in ("i", "f", "type", "np"):
+            setattr(self, key, getattr(source, key))
+        self.capture_response: bool = False
+        self.response_rms: dict[str, torch.Tensor] = {}
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        """三路卷积求和后共享归一化，诊断只复用每轮首个训练批次。"""
+        if image.ndim != 4 or image.shape[1] != 5:
+            raise ValueError("v18首层要求NCHW五通道RGB3+IR1+Depth1输入")
+        rgb = self.rgb(image[:, :3])
+        infrared = self.infrared(image[:, 3:4])
+        depth = self.depth(image[:, 4:5])
+        combined = rgb + infrared + depth
+        if self.training and self.capture_response and torch.is_grad_enabled():
+            self.response_rms = {name: value.detach()[:, :, ::8, ::8].float().square().mean().sqrt()
+                                 for name, value in (("rgb", rgb), ("infrared", infrared),
+                                                     ("depth", depth), ("sum", combined))}
+            self.capture_response = False
+        return self.act(self.bn(combined))
+
+
 class EarlyFusionDetectionModel(DetectionModel):
     """从第一层共同学习三模态，保留官方YOLO主干和双检测头。"""
 
@@ -177,6 +239,13 @@ class EarlyFusionDetectionModel(DetectionModel):
     def init_criterion(self) -> FixedHeadLoss:
         """保持一对多头训练份额，避免缩短epochs后改变v4的实际双头配比。"""
         return FixedHeadLoss(self)
+
+    def split_modal_stem(self) -> None:
+        """在官方迁移后拆分首层，保留已迁移RGB及新增通道初值。"""
+        if isinstance(self.model[0], SplitModalStem):
+            raise ValueError("首层已拆分，不能重复转换")
+        self.model[0] = SplitModalStem(self.model[0])
+        self.early_fusion_version = SPLIT_STEM_VERSION
 
 
 class FusionDetectionModel(DetectionModel):
