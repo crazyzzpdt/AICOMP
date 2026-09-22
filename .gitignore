@@ -274,6 +274,7 @@ runs/
 # 离线预测与赛事提交产物整体忽略，包括运行 JSON
 /predict/
 /predict_*/
+/复赛predict*/
 *.cache
 # 落位后的训练数据不入库，仅保留类别配置文件
 datasets/*

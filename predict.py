@@ -1,7 +1,8 @@
-"""批量预测RGB、红外、深度图，按权重版本处理质量通道并生成提交ZIP。
+"""预测复赛三模态测试集，分别生成排行榜TXT包和代码模型审阅材料。
 
 读取、推理与保存并行调度；检测保持 FP32、单模型、训练同口径预处理。
 结果存入 images、labels、比赛提交内容三个子目录，已有输出目录不覆盖。
+排行榜仅上传submission.zip；其他材料单独交评审，不向GitHub上传数据或权重。
 
 在项目根目录执行预测：
     uv run python predict.py
@@ -20,6 +21,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -29,6 +32,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -60,12 +64,12 @@ from aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION
 
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-# 先重用已有v13最佳权重修正补边提交；v14训练完成后再显式指定其权重。
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v13_native_full/weights/best.pt"
-# 官方初赛的同名 visible、infrared、depth 三模态图像。
-SOURCE_PATH: Path = PROJECT_ROOT / "数据集/测试集/AIC2026_PHASE_1_1000"
+# 保留用户已有权重选择；更换提交模型请显式传--weights，不自动选最新运行。
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v5_full/weights/best.pt"
+# 官方复赛的同名visible、infrared、depth；不得用于训练或伪标签。
+SOURCE_PATH: Path = PROJECT_ROOT / "数据集/复赛测试集"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。
-OUTPUT_PATH: Path = PROJECT_ROOT / "predict_v13_preprocess_fix"
+OUTPUT_PATH: Path = PROJECT_ROOT / "复赛predict_v5"
 
 
 # 赛事规定单图最多100框，所有后端统一截断。
@@ -105,6 +109,15 @@ class PredictionConfig:
     yolo_profile: str = "v4"
     # 新融合模型的内容高度；旧YOLO/D-FINE保持各自历史预处理。
     height: int = 1080
+    # 复赛增加代码、依赖、模型及材料清单；不改变预测框格式或后处理。
+    phase: str = "round2"
+    export_materials: bool = True
+    materials_only: bool = False
+    team_id: str = ""
+    team_name: str = ""
+    captain: str = ""
+    weights_url: str = ""
+    technical_report: Path | None = None
 
 
 @dataclass
@@ -174,7 +187,7 @@ def check_dfine_source() -> Path:
     """检查已下载的固定版本官方源码；缺失时报告准备命令而不联网。"""
     source = PROJECT_ROOT / "vendor" / "D-FINE"
     if not (source / "src/core/yaml_config.py").is_file():
-        raise FileNotFoundError("缺少 vendor/D-FINE，请先按 docs/D-FINE三模态实施方案.md 准备官方源码")
+        raise FileNotFoundError("缺少 vendor/D-FINE，请先按 docs/归档/01_早期训练与清洗.md 的D-FINE章节准备官方源码")
     revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
                               check=True, capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"],
@@ -358,6 +371,8 @@ def validate_model(model: YOLO) -> None:
     Raises:
         ValueError: 任务、首层通道数或类别编号不符。
     """
+    if getattr(model.model, "diagnostic_only", False):
+        raise ValueError("v20 RGB诊断权重不是三模态赛事模型，不能生成赛事提交结果")
     first_conv = next((layer for layer in model.model.modules() if isinstance(layer, torch.nn.Conv2d)), None)
     split_stem = (isinstance(model.model, EarlyFusionDetectionModel) and
                   getattr(model.model, "early_fusion_version", None) == SPLIT_STEM_VERSION and
@@ -706,11 +721,183 @@ def build_submission(output: Path, image_names: list[str]) -> Path:
     return archive
 
 
+def prediction_source_hashes() -> dict[str, str]:
+    """记录本次预测源码摘要，补材料时拒绝用后来修改的代码冒充原运行。"""
+    paths = [("predict.py", Path(__file__))]
+    for folder in ("aic",):
+        paths.extend((path.relative_to(PROJECT_ROOT).as_posix(), path)
+                     for path in sorted((PROJECT_ROOT / folder).glob("*.py")))
+    paths.extend((f"tools/{name}", PROJECT_ROOT / "tools" / name)
+                 for name in ("__init__.py", "prepare_dataset.py")
+                 if (PROJECT_ROOT / "tools" / name).is_file())
+    framework = Path(ultralytics.__file__).parent
+    paths.extend(("ultralytics/" + path.relative_to(framework).as_posix(), path)
+                 for path in sorted(framework.rglob("*"))
+                 if path.is_file() and path.suffix in {".py", ".yaml", ".yml"})
+    hashes: dict[str, str] = {}
+    for name, path in paths:
+        with path.open("rb") as handle:
+            hashes[name] = hashlib.file_digest(handle, "sha256").hexdigest()
+    return hashes
+
+
+def export_round2_materials(config: PredictionConfig, metadata: dict[str, object], archive: Path) -> Path:
+    """分离导出模型和源码，并如实列出未备齐或未验证的复赛材料。
+
+    Note:
+        不复制赛事图像、标签、虚拟环境、Git或整个runs目录。训练源码取所选
+        权重运行的code快照，不用当前v20诊断入口冒充历史模型训练代码。
+        本函数不运行模型、不上传网盘，也不把文件齐全等同于评审环境复现通过。
+    """
+    if metadata.get("source_hashes") != prediction_source_hashes():
+        raise ValueError("预测源码已变化或原记录缺少源码摘要；请恢复原源码后补材料，不能伪称代码与结果一致")
+
+    def copy_file(source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as reader, target.open("xb") as writer:
+            shutil.copyfileobj(reader, writer)
+
+    def copy_sources(source: Path, target: Path) -> int:
+        count = 0
+        for path in sorted(source.rglob("*")):
+            relative = path.relative_to(source)
+            if path.is_symlink() or any(part in {".git", "__pycache__", ".venv"} for part in relative.parts):
+                continue
+            if path.is_file() and (path.suffix.lower() in {".py", ".yaml", ".yml", ".json", ".toml", ".md", ".txt"}
+                                  or path.name in {"LICENSE", "NOTICE"}):
+                copy_file(path, target / relative)
+                count += 1
+        return count
+
+    pending: list[str] = []
+    identity = (config.team_id, config.team_name, config.captain)
+    complete_identity = all(identity)
+    if not complete_identity:
+        pending.append("补充参赛团队编号、团队名称、队长姓名，并按附件2命名根目录")
+    team_id = config.team_id or "待填团队编号"
+    root_name = "-".join((config.team_id, config.team_name, "复赛", config.captain)) if complete_identity else "复赛材料待补队伍信息"
+    # 每次仅打包也另建容器；不覆写上一次已核对的材料。
+    container = config.output / "比赛提交内容" / f"审阅材料_{datetime.now():%Y%m%d_%H%M%S_%f}"
+    root = container / root_name
+    root.mkdir(parents=True, exist_ok=False)
+    code = root / f"{team_id}-代码与数据"
+    model_dir = root / f"{team_id}-模型文件"
+    code.mkdir()
+    model_dir.mkdir()
+    copy_file(config.weights, model_dir / config.weights.name)
+    with (model_dir / config.weights.name).open("rb") as handle:
+        if hashlib.file_digest(handle, "sha256").hexdigest() != metadata["weights_sha256"]:
+            raise ValueError("导出的模型与预测使用的模型摘要不一致，材料未完成")
+    copy_file(archive, root / "submission.zip")
+    copy_file(config.output / "prediction.json", root / "prediction.json")
+    copy_file(Path(__file__), code / "predict.py")
+    copy_sources(PROJECT_ROOT / "aic", code / "aic")
+    copy_sources(PROJECT_ROOT / "docs", code / "docs")
+    for name in ("pyproject.toml", "uv.lock"):
+        if (PROJECT_ROOT / name).is_file():
+            copy_file(PROJECT_ROOT / name, code / name)
+    for name in ("__init__.py", "prepare_dataset.py"):
+        if (PROJECT_ROOT / "tools" / name).is_file():
+            copy_file(PROJECT_ROOT / "tools" / name, code / "tools" / name)
+    # 当前安装包含项目所需YOLO接口，不能仅写一个pip版本号就声称源码一致。
+    copy_sources(Path(ultralytics.__file__).parent, code / "ultralytics")
+    if metadata["backend"] == "dfine":
+        copy_sources(check_dfine_source(), code / "vendor" / "D-FINE")
+        pending.append("D-FINE源码包不含Git元数据；复现前按固定提交准备仓库以满足现有版本校验")
+    run = config.weights.parent.parent
+    snapshot = run / "code"
+    if (snapshot / "main.py").is_file():
+        copy_sources(snapshot, code / "训练源码")
+    elif (run / "main.py").is_file():
+        # v4/v5将源码直接留在运行根目录，只复制同层Python，不递归带入图像和权重。
+        for path in sorted(run.glob("*.py")):
+            if not path.is_symlink():
+                copy_file(path, code / "训练源码" / path.name)
+        pending.append("已导出旧运行根目录Python快照；需按其导入核对依赖完整性和当时框架版本")
+    else:
+        pending.append("所选模型缺少训练main.py快照：从该版本Git恢复真实训练源码，不能使用当前v20入口替代")
+    for name in ("args.yaml", "optimization_recipe.json"):
+        if (run / name).is_file():
+            copy_file(run / name, code / "训练记录" / name)
+    packages = ("torch", "torchvision", "ultralytics", "numpy", "opencv-python", "pillow", "PyYAML",
+                "scipy", "matplotlib", "tqdm", "psutil", "requests", "polars", "ultralytics-thop",
+                "faster-coco-eval", "loguru", "tensorboard", "transformers", "calflops")
+    dependencies: list[str] = []
+    for package in packages:
+        try:
+            dependencies.append(f"{package}=={version(package)}")
+        except PackageNotFoundError:
+            pending.append(f"未发现{package}的安装元数据，需核对依赖")
+    (code / "requirements.txt").write_text("\n".join(dependencies) + "\n", encoding="utf-8")
+    if config.technical_report is not None:
+        copy_file(config.technical_report, root / f"{team_id}-技术方案.PDF")
+    else:
+        template = PROJECT_ROOT / "docs" / "技术方案.md"
+        draft = template.read_text(encoding="utf-8") if template.is_file() else "# 复赛技术方案（待定稿）\n"
+        # 报告位于材料根目录，关联知识文档位于代码目录，不留下迁移后的断链。
+        draft = re.sub(r'\]\(([^():\n]+\.md(?:#[^()\n]*)?)\)',
+                       lambda match: f']({team_id}-代码与数据/docs/{match.group(1)})', draft)
+        actual = {key: metadata.get(key) for key in ("run", "weights", "weights_sha256", "phase", "images", "backend",
+                  "architecture", "fusion_version", "imgsz", "height", "conf", "iou", "max_det", "preprocess")}
+        draft += "\n\n## 本次实际提交候选（自动记录）\n\n```json\n" + json.dumps(actual, ensure_ascii=False, indent=2) + "\n```\n"
+        (root / f"{team_id}-技术方案.md").write_text(draft, encoding="utf-8")
+        pending.append("已按用户要求提供技术方案Markdown草稿，待核对实际提交模型并定稿转PDF；MD不是PDF替代证明")
+    if not config.weights_url:
+        pending.append("补充仅供赛事评审访问的模型权重下载链接，不使用GitHub公开存储")
+    pending.append("在评审目标环境按说明复现；当前仅打包，未验证依赖安装或训练/推理可运行性")
+    pending.append("训练复现须另行准备官方数据、既有清洗清单/审计及该版本初始化权重；不随代码复制大文件")
+    height = metadata.get("height", metadata["imgsz"])
+    iou = metadata.get("iou")
+    iou = 0.7 if iou is None else iou
+    command = (f'python predict.py --weights "../{team_id}-模型文件/{config.weights.name}" '
+               f'--source "官方复赛测试集路径" --output predict_review --phase round2 '
+               f'--imgsz {metadata["imgsz"]} --height {height} --batch {metadata["batch"]} '
+               f'--conf {metadata["conf"]} --iou {iou} --device {metadata["device"]} '
+               f'--max-det {metadata["max_det"]} --expected-count {metadata["images"]} '
+               f'--yolo-profile {metadata.get("yolo_profile") or "v4"} '
+               f'{"--multi-label" if metadata.get("multi_label") else "--no-multi-label"} --no-export-materials')
+    description = ("# 复赛项目说明\n\n"
+        "本项目使用可见光、红外和深度图进行12类目标检测。仅单模型预测，不做投票集成。\n\n"
+        f"模型运行：`{metadata['run']}`；SHA256：`{metadata['weights_sha256']}`。\n\n"
+        f"权重下载链接：{config.weights_url or '待补（权重已单独放在模型文件目录）'}。\n\n"
+        "## 环境与运行\n\n"
+        f"生成环境Python={sys.version.split()[0]}，PyTorch={metadata['torch']}；GPU/CUDA平台须匹配。\n"
+        "按requirements.txt准备依赖；PyTorch CUDA轮子来源见pyproject.toml，不能以CPU版本冒充。\n"
+        "ultralytics/是本次预测实际使用的源码副本，优先于普通pip包；不含虚拟环境。\n"
+        "先在联网准备环境阶段安装依赖，正式推理离线运行，不自动下载权重或依赖。\n\n"
+        f"在本目录执行复现预测命令（替换官方测试集路径）：\n\n```powershell\n{command}\n```\n\n"
+        "## 文件与训练复现\n\n"
+        "predict.py负责预处理、推理和打包；aic/保存模型及共享处理；tools/保留数据准备源码。\n"
+        "训练源码/为所选模型的运行快照（如有），训练记录/为其实际配置；不要使用当前仓库v20诊断入口替代。\n"
+        "训练前按原配置准备官方数据、既有审计与官方初始化权重，并在训练源码目录执行main.py；"
+        "路径和源码指纹须按该快照处理，具体缺项见材料清单。代码与数据目录名沿用附件，实际不含数据。\n\n"
+        "训练运行时须将本代码根目录加入PYTHONPATH，使自定义ultralytics源码可见；"
+        "当前预测框架副本不自动等同于历史训练框架，须核对该模型原记录。docs/保留技术依据与历史适用范围。\n\n"
+        "## 提交与注意事项\n\n"
+        "根目录submission.zip与排行榜提交结果相同，只含同名六列TXT；空检测也有空TXT。\n"
+        "模型文件与代码分开放置；大数据/环境不入代码目录。测试集不用于训练、标注或人工改结果。\n"
+        "仅通过报名系统指定渠道向评审分享材料，不能把赛事数据、权重包上传公开GitHub。\n"
+        "本材料包未经目标机器复现验证，不能据文件存在宣称训练复现成功。\n")
+    (code / "README.md").write_text(description, encoding="utf-8")
+    manifest = {"phase": "round2", "status": "needs_review", "pending": pending,
+                "weights_sha256": metadata["weights_sha256"], "inference_verified_on_reviewer_machine": False,
+                "files": []}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            with path.open("rb") as handle:
+                manifest["files"].append({"path": path.relative_to(root).as_posix(),
+                                          "sha256": hashlib.file_digest(handle, "sha256").hexdigest()})
+    (root / "材料清单.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    (root / "待完善.md").write_text("# 复赛材料待核对\n\n" + "\n".join(f"- {item}" for item in pending) + "\n", encoding="utf-8")
+    print(f"复赛审阅材料已导出：{root}\n尚有{len(pending)}项需核对，见待完善.md；未上传、未宣称完整交付。")
+    return root
+
+
 # 五、配置覆盖与预测调度
 def parse_arguments(config: PredictionConfig, argv: list[str]) -> PredictionConfig:
     """保留既有命令行用法，未传参数时采用 predict.py 中的分节配置。"""
     parser = argparse.ArgumentParser(description="三模态批量预测与赛事提交，默认值见 predict.py", argument_default=argparse.SUPPRESS)
-    for name in ("weights", "source", "output"):
+    for name in ("weights", "source", "output", "technical-report"):
         parser.add_argument(f"--{name}", type=Path)
     for name in ("imgsz", "height", "batch", "workers", "save-workers", "prefetch-batches", "expected-count", "max-det", "png-compression", "log-every"):
         parser.add_argument(f"--{name}", type=int)
@@ -721,6 +908,11 @@ def parse_arguments(config: PredictionConfig, argv: list[str]) -> PredictionConf
     parser.add_argument("--device", help="单张 GPU 编号或 cpu")
     parser.add_argument("--multi-label", action=argparse.BooleanOptionalAction, help="仅适用于 YOLO 的多标签 NMS")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, help="D-FINE 使用锁页内存传输当前批次")
+    parser.add_argument("--phase", choices=("round1", "round2"))
+    parser.add_argument("--export-materials", action=argparse.BooleanOptionalAction, help="复赛预测后导出源码/模型/依赖及待完善清单")
+    parser.add_argument("--materials-only", action="store_true", help="从本次代码已生成的复赛结果补导材料，不运行模型")
+    for name in ("team-id", "team-name", "captain", "weights-url"):
+        parser.add_argument(f"--{name}")
     return replace(config, **vars(parser.parse_args(argv)))
 
 
@@ -737,6 +929,18 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
     """
     if argv is not None:
         config = parse_arguments(config, argv)
+    if config.phase not in {"round1", "round2"}:
+        raise ValueError("phase必须是round1或round2")
+    for value in (config.team_id, config.team_name, config.captain):
+        if value and (re.search(r'[<>:"/\\|?*\x00-\x1f]', value) or value.strip() != value or
+                      value.endswith(".") or value in {".", ".."}):
+            raise ValueError("队伍信息不能含路径分隔符、首尾空格或Windows非法文件名字符")
+    if config.technical_report is not None:
+        report = (PROJECT_ROOT / config.technical_report).resolve(strict=True)
+        with report.open("rb") as handle:
+            if report.suffix.lower() != ".pdf" or handle.read(5) != b"%PDF-":
+                raise ValueError("技术方案须为真实PDF文件，不把Markdown改后缀当作PDF")
+        config = replace(config, technical_report=report)
     if config.imgsz <= 0 or config.imgsz % 32:
         raise ValueError("imgsz 必须为 32 的正整数倍")
     if min(config.batch, config.workers, config.save_workers, config.prefetch_batches, config.expected_count, config.log_every) <= 0:
@@ -752,7 +956,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
     if config.yolo_profile not in {"v4", "current"}:
         raise ValueError("yolo_profile 必须为 v4 或 current")
     weights, source, output = ((PROJECT_ROOT / path).resolve() for path in (config.weights, config.source, config.output))
-    if output.exists():
+    if output.exists() and not config.materials_only:
         raise FileExistsError(f"输出目录已存在，不会覆盖：{output}；请用 --output 指定新目录")
     if not weights.is_file() or weights.suffix.lower() not in {".pt", ".pth"}:
         raise FileNotFoundError(f"请指定已有的本地 .pt/.pth 五通道检测权重：{weights}")
@@ -763,8 +967,21 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
         raise ValueError(f"测试集应有 {config.expected_count} 组，实际找到 {len(samples)} 组；请检查 --source")
     with weights.open("rb") as handle:
         weight_hash: str = hashlib.file_digest(handle, "sha256").hexdigest()
+    if config.materials_only:
+        metadata = json.loads((output / "prediction.json").read_text(encoding="utf-8"))
+        archive = output / "比赛提交内容" / "submission.zip"
+        if (config.phase != "round2" or metadata.get("phase") != "round2" or
+                metadata.get("weights_sha256") != weight_hash or metadata.get("images") != len(samples) or
+                metadata.get("source") != source.name):
+            raise ValueError("仅补材料要求原复赛记录、同一权重与测试集；不能把初赛结果重新标成复赛")
+        with archive.open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != metadata.get("submission_sha256"):
+                raise ValueError("排行榜结果包已改变或缺少摘要，拒绝与其他模型材料混用")
+        export_round2_materials(replace(config, weights=weights, source=source, output=output), metadata, archive)
+        return
     backend = ("dfine" if weights.suffix.lower() == ".pth" else "yolo") if config.backend == "auto" else config.backend
     config = replace(config, weights=weights, source=source, output=output, backend=backend)
+    source_hashes = prediction_source_hashes()
     if backend == "dfine":
         if config.multi_label:
             raise ValueError("--multi-label 是 YOLO NMS 开关；D-FINE 使用原生查询类别排序，请移除此开关")
@@ -834,7 +1051,8 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
         cv2.setNumThreads(previous_cv_threads)
     elapsed = time.perf_counter() - started
     metadata: dict[str, object] = {
-        "created_at": datetime.now().astimezone().isoformat(), "weights": weights.name,
+        "created_at": datetime.now().astimezone().isoformat(), "weights": weights.name, "phase": config.phase,
+        "source_hashes": source_hashes,
         "run": weights.parent.parent.name, "weights_sha256": weight_hash, "source": source.name,
         "images": len(samples), "classes": list(CLASS_NAMES), "ultralytics": ultralytics.__version__,
         "torch": torch.__version__, "imgsz": config.imgsz, "conf": config.conf, "iou": config.iou,
@@ -868,27 +1086,39 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                          "postprocess": "framework_native_single_label_nms" if config.yolo_profile == "v4" else "custom_nms",
                          "effective_model_batch": 1 if config.yolo_profile == "v4" else config.batch,
                          "legacy_source_commit": "86411da" if config.yolo_profile == "v4" else None})
+    archive = build_submission(output, [sample[0].name for sample in samples])
+    with archive.open("rb") as handle:
+        metadata["submission_sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
     with (output / "prediction.json").open("x", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
-    archive = build_submission(output, [sample[0].name for sample in samples])
     print(f"读取、推理、绘图与保存共 {elapsed:.1f} 秒，平均 {len(samples) / elapsed:.2f} 组/秒（不含模型加载与 ZIP 打包）")
-    print(f"提交包校验通过，共 {len(samples)} 个 TXT：{archive}\n初赛只提交此 ZIP；images、prediction.json 不放入提交包。")
+    print(f"排行榜结果包校验通过，共 {len(samples)} 个TXT：{archive}\n只将此ZIP上传结果入口，代码/权重不混入TXT包。")
+    if config.phase == "round2" and config.export_materials:
+        export_round2_materials(config, metadata, archive)
 
 
 # Windows 子进程或其他模块可能导入入口，正式预测必须放在入口保护内。
 if __name__ == "__main__":
     predict(PredictionConfig(
         # 一、模型、数据与输出
-        weights=MODEL_PATH,  # 先重用v13已有EMA最佳，不必为修正预测补边重新训练
+        weights=MODEL_PATH,  # 保留用户选择；用--weights显式选择复赛候选，不自动使用v20诊断权重
         source=SOURCE_PATH,  # 只读官方三模态图像，不生成缓存或修改原始文件
         output=OUTPUT_PATH,  # 保存带框图片、六列标签和提交 ZIP，已有目录不覆盖
         backend="auto",  # 从检查点识别融合结构；仍兼容旧YOLO和D-FINE
-        expected_count=1000,  # 已确认初赛为 1000 组，仅核对文件清单避免交错目录
+        expected_count=1000,  # 当前复赛三个模态各1000张，仍要求完整同名配对
+        phase="round2",  # 复赛：排行榜结果与代码模型材料分开提交
+        export_materials=True,  # 结果完成后导出审阅材料，缺项明确列出，不自动上传
+        materials_only=False,  # 已完成预测后可传--materials-only补材料，不重新推理
+        team_id="",  # 填报名系统团队编号或传--team-id，不猜测当前队伍信息
+        team_name="",  # 填正式团队名称或传--team-name
+        captain="",  # 填队长姓名或传--captain；缺少时材料标为待完善
+        weights_url="",  # 仅供评审的权重下载链接，不公开上传赛事数据
+        technical_report=None,  # 未定稿时用docs/技术方案.md草稿，完成后填写真实PDF路径
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
-        imgsz=1280,  # 与v13原生方形训练尺度一致
-        height=1280,  # FusionPredictor据此构造1280×1280画布
-        batch=4,  # FP32矩形批量推理，用户可按显存调整；本轮未实测峰值
+        imgsz=1280,  # 当前v5训练尺度；更换融合权重时按其训练几何设置
+        height=1280,  # 供融合后端构造画布，旧YOLO保持其原生矩形填充
+        batch=4,  # 读取调度批次；旧YOLO v4路径仍逐张前向，本轮未实测峰值
         workers=8,  # 并行解码三模态并提前缩放，给 GPU 连续准备输入
         save_workers=8,  # 后台画框、编码和写文件，不再逐张阻塞下一次推理
         prefetch_batches=2,  # 全尺寸图片预取2批，控制五通道与待保存原图内存

@@ -1,10 +1,10 @@
 # Ultralytics 预测参数参考
 
-2026-09-21 更新：fusion预测与验证统一五通道补边及真实内容裁框，协议fp32_single_label_content_clip_v2；已通过PNG/JPG输入逐像素一致及两图预测ZIP检查。新协议本地AP须与同协议基线比较，不等同线上分数。复赛数据数量须以实际资料为准，不套用初赛1000组；详见[v14执行记录](v14一致性修复与执行记录.md)。
+2026-09-21 更新：fusion预测与验证统一五通道补边及真实内容裁框，协议fp32_single_label_content_clip_v2；已通过PNG/JPG输入逐像素一致及两图预测ZIP检查。新协议本地AP须与同协议基线比较，不等同线上分数。复赛数据数量须以实际资料为准，不套用初赛1000组；详见[v14执行记录](../归档/02_v9至v14复盘.md#record-7)。
 
-2026-09-20 修正：不能只凭imgsz相同就声称训练/预测一致。v12/v13的native_square验证五通道补114，旧预测误用了fixed_rect的辅助通道补0；现按权重recipe.geometry选择，native_square共享ceil缩放并使用原生114补边。prediction.json记录实际geometry、padding_values和预处理版本；固定画布rect=False。默认重用v13 best输出predict_v13_preprocess_fix，不改conf0.001/iou0.7/max_det100。旧v4、固定矩形及D-FINE保留各自历史路径。未跑预测，收益待用户提交；详见[v13复盘](v13复盘与v14阶段筛选.md)。下方历史默认值不覆盖本段。
+2026-09-20 修正：不能只凭imgsz相同就声称训练/预测一致。v12/v13的native_square验证五通道补114，旧预测误用了fixed_rect的辅助通道补0；现按权重recipe.geometry选择，native_square共享ceil缩放并使用原生114补边。prediction.json记录实际geometry、padding_values和预处理版本；固定画布rect=False。默认重用v13 best输出predict_v13_preprocess_fix，不改conf0.001/iou0.7/max_det100。旧v4、固定矩形及D-FINE保留各自历史路径。未跑预测，收益待用户提交；详见[v13复盘](../归档/02_v9至v14复盘.md#record-6)。下方历史默认值不覆盖本段。
 
-2026-09-18 项目适配：当前入口区分YOLO .pt与D-FINE .pth。YOLO默认yolo_profile=v4，逐张矩形填充、原生单标签NMS；current保留批量自定义候选。D-FINE使用五通道正方形等比填充和原生查询排序，iou/multi_label不是它的调参开关，必须匹配训练imgsz。visual_conf与输出压缩只影响展示和写盘，不改变检测输入或TXT候选；conf降低未必改变每图前100框。用法见 [预测文档](预测与赛事提交.md)。
+2026-09-18 项目适配：当前入口区分YOLO .pt与D-FINE .pth。YOLO默认yolo_profile=v4，逐张矩形填充、原生单标签NMS；current保留批量自定义候选。D-FINE使用五通道正方形等比填充和原生查询排序，iou/multi_label不是它的调参开关，必须匹配训练imgsz。visual_conf与输出压缩只影响展示和写盘，不改变检测输入或TXT候选；conf降低未必改变每图前100框。用法见 [预测文档](../预测与赛事提交.md)。
 
 来源（2026-09-16 整理）：
 
