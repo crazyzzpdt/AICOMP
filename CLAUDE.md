@@ -73,7 +73,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 任务：对空间对齐的三模态图像（RGB 可见光 / 红外 / 深度）做 12 类目标检测，输出每张测试图的检测框 TXT。排行榜指标为 `mAP@50-95`。赛题权威参考：`docs/比赛资料/2026 AIC 视觉多模态目标检测参赛手册.md`。
 
-**当前进度**：三模态早期融合训练已实现——`main.py`（YOLO26l，RGB 3 + 红外 1 + 深度 1 共 5 通道输入）+ `三模态训练.py`（自定义训练器）+ `准备三模态数据集.py`（新版标注数据集构建）+ `tests/`。`predict.py` 提供离线五通道预测、带框图片、六列 TXT 和初赛 ZIP；详见 `docs/预测与赛事提交.md`，已有输出目录不覆盖。
+**当前进度**：YOLO与D-FINE已隔离：`train1.py/predict1.py`及`src/yolo/`负责YOLO，`train2.py/predict2.py`及`src/D-FINE/`负责D-FINE。复赛源为`datasets/test`，预测结果统一进入`历史产出/`；详见`docs/代码结构与运行.md`和`docs/预测与赛事提交.md`。
 
 最新复盘：v4_clean_lr1e4 已完成 200 轮，CSV 最高 mAP50=0.60632（42 轮）、mAP50-95=0.40370（100 轮），高于旧运行与 v3 的记录。当前配方 l/1280/batch=4、workers=4、AdamW、lr0=0.0001、nbs=16；上限 5000，学习率前 200 轮衰减、第 101 轮关闭 Mosaic，epochs 仍影响双头损失日程。已实施定向清洗并保留完整审计。predict.py 默认 v4 best.pt，mAP50 候选 epoch50.pt 实际为第 51 轮（0.59183）；第 42 轮未留存。当前先使用现有单个权重，不立即重训。弱类采样、多标签后处理、双指标留存和不同预训练基底尚未启用。详见 `docs/归档/04_数据与调参经验.md#record-2`。
 
@@ -81,11 +81,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # 训练（三模态五通道融合入口；命令变体见 main.py 顶部文档字符串）
-uv run python main.py
+uv run python train1.py
 
 # 断点续训：把 main.py 顶部 RESUME_PATH 设为
 # 同配方中断运行的实际 weights/last.pt；完成后剥离优化器的权重不能原状态恢复
-uv run python main.py
+uv run python train1.py
 
 # 默认生成清洗审阅包；落位需指定已确认记录的 --apply-review
 uv run python 准备三模态数据集.py

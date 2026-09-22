@@ -79,11 +79,12 @@ v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0
 
 ## 项目结构与模块组织
 
-- `main.py`：唯一训练入口，保留原生YOLO分节参数，调用`aic.training`。
-- `predict.py`：唯一预测入口和预测实现，负责推理、坐标恢复、图片/TXT保存与提交ZIP打包；已有结果不覆盖。
-- `aic/model.py`：模型结构及训练/预测共用几何处理，保持旧v9模型模块名兼容。
-- `aic/data.py`：类别常量、共享三模态读取与文件指纹，不依赖训练器或清洗工具。
-- `aic/training.py`：当前融合训练器、矩形数据集和正式轮末验证；不单独启动。
+- `train1.py`：唯一YOLO训练入口，调用`src.yolo.aic.training`。
+- `train2.py`：唯一D-FINE训练入口，转发`src/D-FINE/train.py`。
+- `predict1.py`：YOLO预测入口，负责YOLO推理、坐标恢复、图片/TXT保存与提交ZIP。
+- `predict2.py`：D-FINE预测入口，保持D-FINE原生查询排序。
+- `src/yolo/aic/`：YOLO模型、数据、训练器与共用几何处理。
+- `src/D-FINE/`：D-FINE官方模型、训练器与部署工具。
 - `tools/prepare_dataset.py`：保留有记录的审计清洗能力，日常训练无需执行。
 - 评估模型.py、tests/ 与 runs/config_checks 已移出工作位置，其code_cleanup备份随后经授权删除；不是训练或预测依赖。
 - `datasets/`：仅包含 `train/`、`val/` 与必需的 `data.yaml`；仅 `datasets/data.yaml` 入库。
@@ -93,8 +94,10 @@ v5_full 已完成 234 轮，最佳 mAP50-95=0.40625（34 轮），最高 mAP50=0
 ## 构建、测试与开发命令
 
 - `uv sync`：根据 `pyproject.toml` 和 `uv.lock` 创建或更新环境。
-- `uv run python main.py`：开始训练（在项目根目录执行）。
-- `uv run python predict.py`：预测官方初赛测试集并打包；默认权重由用户维护。新模型显式使用 `--weights runs/detect/AIC_RGBIRDepth_dfine_l_1280_v6/weights/best.pth --output predict_v6`，不自动选择最新运行。
+- `uv run python train1.py`：开始YOLO训练（在项目根目录执行）。
+- `uv run python train2.py -c <配置文件>`：开始D-FINE训练。
+- `uv run python predict1.py`：预测YOLO复赛测试集并打包。
+- `uv run python predict2.py`：预测D-FINE复赛测试集并打包。
 - `uv run python -m tools.prepare_dataset`：使用官方新版标注更新 `datasets/train`、`datasets/val` 和五通道配置。
 - 断点续训：当前 RESUME_PATH 仅填写同配方中断运行的实际 last.pt，恢复写入新目录；完成/早停检查点拒绝恢复，更换配方保持 None。last.pth 属于历史D-FINE。
 - 已完成 v5 配方：AdamW、lr0=0.0001（骨干 0.2 倍）、nbs=16、batch=4、patience=200；MAX_EPOCHS=5000，学习率前 200 轮衰减，第 161 轮关闭 Mosaic/目标裁剪/模态缺失。训练/验证各 4 个加载进程、预取 1 批、关闭锁页；epochs 仍影响双头损失日程。

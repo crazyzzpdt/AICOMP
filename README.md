@@ -4,19 +4,23 @@
 
 ## 当前状态（2026-09-23）
 
-- main.py：v20 RGB诊断，保留200轮学习率日程、20轮预算；仅用于决策，不是赛事提交模型，本轮未运行。
-- predict.py：默认只读“数据集/复赛测试集”，保留用户选择的v5 best.pt，输出“复赛predict_v5”；不自动替换权重。
-- 预测结果TXT ZIP与复赛审阅材料分开，技术方案先用Markdown草稿，PDF和队长等信息待补。
+- train1.py：YOLO v20 RGB诊断入口；仅用于决策，不是赛事提交模型，本轮未运行。
+- train2.py：D-FINE独立训练入口，源码在src/D-FINE。
+- predict1.py/predict2.py：分别负责YOLO/D-FINE复赛预测；源目录为datasets/test，结果写入历史产出。
+- 预测结果TXT ZIP与复赛审阅材料分开；团队信息已填写，技术方案先用Markdown草稿，PDF仍待定稿。
 - 训练数据仍为既有清洗1709/291。本轮未测试、训练、预测或新增清洗。
 
 ## 使用
 
 ```powershell
 # 用户选择启动20轮诊断，不是自动提交训练
-uv run python main.py
+uv run python train1.py
 
 # 用入口所选三模态权重预测复赛；已有输出不覆盖
-uv run python predict.py
+uv run python predict1.py
+
+# D-FINE预测
+uv run python predict2.py
 ```
 
 预测完整配置、更换权重、仅补材料和正式提交注意事项见[预测与赛事提交](docs/预测与赛事提交.md)。文件存在不代表材料已通过评审环境复现；MD草稿不冒充PDF。
@@ -25,6 +29,6 @@ uv run python predict.py
 
 [代码结构](docs/代码结构与运行.md) · [数据与清洗](docs/数据集与清洗.md) · [技术方案草稿](docs/技术方案.md) · [训练及类别对比](docs/历次训练与赛事分数对比.md) · [16条初赛成绩](docs/初赛提交成绩台账.md) · [v20诊断计划](docs/v19复盘与v20模态诊断.md)
 
-零散旧文档已完整合订到docs/归档；参数参考移至docs/参考；官方材料保留docs/比赛资料。历史v4最高55.6000属于初赛，不换算复赛分数或本地AP。当前没有达到0.60的证据。
+零散旧文档已完整合订到docs/归档；官方材料保留docs/比赛资料。历史v4最高55.6000属于初赛，不换算复赛分数或本地AP。当前没有达到0.60的证据。
 
 仅提交源码和知识文档。官方数据、权重、runs、预测结果、原始PDF与本地测试产物不入GitHub。

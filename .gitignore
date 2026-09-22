@@ -275,6 +275,8 @@ runs/
 /predict/
 /predict_*/
 /复赛predict*/
+/历史产出/
+/src/tools/run_snapshots/
 *.cache
 # 落位后的训练数据不入库，仅保留类别配置文件
 datasets/*
