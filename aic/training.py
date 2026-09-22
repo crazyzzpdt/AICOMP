@@ -41,6 +41,7 @@ from ultralytics.utils.torch_utils import unwrap_model
 
 # 自己的模块
 from .model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
+                    RGB_DIAGNOSTIC_VERSION, RGBDiagnosticModel,
                     EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, QualityFusionDetectionModel, QualityLetterBox,
                     canvas_shape, clip_canvas_boxes, letterbox_fused, resize_channels, resize_native_fused,
                     resize_native_quality, single_label_nms)
@@ -214,6 +215,16 @@ class MultimodalYOLODataset(YOLODataset):
         super().close_mosaic(hyp)
 
 
+class RGBDiagnosticDataset(MultimodalYOLODataset):
+    """复用v14完整增强后只输出RGB，避免三通道Format翻转颜色和额外增强。"""
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        # 磁盘和增强仍是原五通道；网络收到真正三通道，不用辅助输入置零伪装融合。
+        sample = super().__getitem__(index)
+        sample["img"] = sample["img"][:3].contiguous()
+        return sample
+
+
 class QualityMosaic(Mosaic):
     """保留原生四图布局与标签变换，空白区只有RGB填114。"""
 
@@ -312,6 +323,8 @@ class FusionRecipe:
     repeat_group_limit: int = 2
     repeat_ball_cap: float = 1.25
     split_stem: bool = False
+    # 与epochs学习率日程解耦；None保持历史行为，预算结束仍保存当轮完整产物。
+    budget_epochs: int | None = None
 
 
 def sampling_group(path: str) -> str:
@@ -713,11 +726,12 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def __init__(self, *args: Any, recipe: FusionRecipe, **kwargs: Any) -> None:
         self.recipe = recipe
-        if recipe.architecture not in {"gated_v9", "early_v10", "quality_v19"}:
+        if recipe.architecture not in {"gated_v9", "early_v10", "quality_v19", "rgb_v20"}:
             raise ValueError("未知三模态融合配方")
         if recipe.geometry not in {"fixed_rect", "native_square"}:
             raise ValueError("未知输入几何配方")
-        self.early_fusion = recipe.architecture == "early_v10"
+        self.rgb_diagnostic = recipe.architecture == "rgb_v20"
+        self.early_fusion = recipe.architecture in {"early_v10", "rgb_v20"}
         self.quality_fusion = recipe.architecture == "quality_v19"
         self.native_square = recipe.geometry == "native_square"
         self.recipe_version = EARLY_FUSION_VERSION if self.early_fusion else FUSION_VERSION
@@ -725,6 +739,8 @@ class FusionDetectionTrainer(DetectionTrainer):
             self.recipe_version = SPLIT_STEM_VERSION
         if self.quality_fusion:
             self.recipe_version = QUALITY_FUSION_VERSION
+        if self.rgb_diagnostic:
+            self.recipe_version = RGB_DIAGNOSTIC_VERSION
         self.requested = dict(kwargs.get("overrides") or {})
         self.resume_metadata: dict[str, Any] | None = None
         self.parent_initialization: dict[str, Any] | None = None
@@ -737,6 +753,16 @@ class FusionDetectionTrainer(DetectionTrainer):
         if self.args.batch < 1 or self.args.nbs % self.args.batch or self.args.cache:
             raise ValueError("batch须为有效批次nbs的正整数因子，且cache=False")
         self._validate_training_stage()
+        if recipe.budget_epochs is not None and (
+                type(recipe.budget_epochs) is not int or not 1 <= recipe.budget_epochs <= self.args.epochs):
+            raise ValueError("训练预算轮次须为[1,epochs]中的整数；不会改变学习率日程")
+        if self.rgb_diagnostic and (not self.native_square or recipe.split_stem or
+                recipe.training_stage != "main" or recipe.repeat_threshold != 0 or
+                recipe.budget_epochs is None or recipe.screening_thresholds or
+                recipe.early_backbone_lr is None or not self.args.val or not self.args.save or
+                self.args.cls_pw != 0 or self.args.augmentations is not None or
+                any(getattr(self.args, key) != 0 for key in ("hsv_h", "hsv_s", "hsv_v", "bgr"))):
+            raise ValueError("RGB诊断要求原生main、显式预算/骨干lr、无采样/类别加权/颜色增强/AP门槛且保存验证结果")
         if (not self.early_fusion and self.args.cls_pw != 0) or self.args.optimizer != "AdamW" or self.args.nms is not True:
             raise ValueError("融合配方要求AdamW与nms=True；v9另外要求cls_pw=0")
         for value, maximum in ((recipe.polish_scale, self.args.scale), (recipe.polish_translate, self.args.translate)):
@@ -806,6 +832,8 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
         """复用训练批次记录采样，不改变图像归一化或标签。"""
+        if self.rgb_diagnostic and (batch["img"].ndim != 4 or batch["img"].shape[1] != 3):
+            raise ValueError("RGB诊断网络只接收NCHW三通道，不能误传旧五通道或v19支持张量")
         if self.recipe.repeat_threshold:
             self.train_loader.sampler.record_batch(batch)
         return super().preprocess_batch(batch)
@@ -875,7 +903,8 @@ class FusionDetectionTrainer(DetectionTrainer):
         if weights is None:
             raise ValueError("请从本地官方YOLO26l预训练权重创建融合模型")
         source = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights
-        model_type = QualityFusionDetectionModel if self.quality_fusion else EarlyFusionDetectionModel if self.early_fusion else FusionDetectionModel
+        model_type = (RGBDiagnosticModel if self.rgb_diagnostic else QualityFusionDetectionModel if self.quality_fusion
+                      else EarlyFusionDetectionModel if self.early_fusion else FusionDetectionModel)
         model = self.set_model_names_for_load(model_type(cfg or source.yaml, self.data["nc"], verbose))
         if self.recipe.training_stage == "polish":
             # cls_remap=False只禁止重排分类权重，不能把真实类名留为构建器的数字占位名。
@@ -921,6 +950,8 @@ class FusionDetectionTrainer(DetectionTrainer):
                 model.initialize_auxiliary_from_rgb()
                 LOGGER.info("v19迁移：IR第0–4层继承RGB（首层通道求和）；Depth首层32个值滤波器继承RGB，支持权重零初始化可训练")
         model.content_hw = (self.recipe.image_height, self.recipe.image_width)
+        if self.rgb_diagnostic:
+            LOGGER.info("v20实际网络首层输入3通道；构建期间显示的五通道摘要仅为保留v14初始化顺序，非最终结构")
         if self.resume_metadata:
             model.fusion_training = deepcopy(self.resume_metadata)
         else:
@@ -981,7 +1012,8 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None) -> MultimodalYOLODataset:
         if self.native_square:
-            dataset_type = QualityYOLODataset if self.quality_fusion else MultimodalYOLODataset
+            dataset_type = (RGBDiagnosticDataset if self.rgb_diagnostic else
+                            QualityYOLODataset if self.quality_fusion else MultimodalYOLODataset)
             return dataset_type(
                 img_path=img_path, imgsz=self.args.imgsz, batch_size=batch,
                 augment=mode == "train", hyp=copy(self.args), rect=False, cache=False,
@@ -1130,6 +1162,14 @@ class FusionDetectionTrainer(DetectionTrainer):
                                    "recipe": asdict(self.recipe), "hyp": settings,
                                    "audit": self.audit, "sources": sources, "framework": framework,
                                    "parent_initialization": self.parent_initialization}
+        if self.rgb_diagnostic:
+            self.training_signature["diagnostic"] = {
+                "submission_candidate": False, "network_channels": ["R", "G", "B"],
+                "data_pipeline": "v14_five_channel_augmentation_then_select_rgb",
+                "schedule_epochs": self.epochs, "budget_epochs": self.recipe.budget_epochs,
+                "comparison": "v14_same_split_first_20_epochs_not_final_ceiling",
+                "train_batch": self.batch_size, "val_batch": self.recipe.val_batch,
+            }
         if self.quality_fusion:
             self.training_signature["quality_preprocessing"] = {
                 "version": QUALITY_PREPROCESS_VERSION, "input_channels": 6,
@@ -1154,10 +1194,11 @@ class FusionDetectionTrainer(DetectionTrainer):
             {**self.training_signature, "content_hw": [self.recipe.image_height, self.recipe.image_width],
              "tensor_hw": canvas_shape((self.recipe.image_height, self.recipe.image_width)),
              "validation_geometry": validation_geometry,
-             "validation_padding": [114, 114, 114, 0, 0, 0] if self.quality_fusion else [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
+             "validation_padding": [114] * 3 if self.rgb_diagnostic else [114, 114, 114, 0, 0, 0] if self.quality_fusion else [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
              "polish_start_epoch": 1 if self.recipe.training_stage == "polish" else self.epochs - self.args.close_mosaic + 1,
              "head_loss_weights": [0.8, 0.2], "validation_precision": "FP32",
              "initialization": self.parent_initialization["kind"] if self.parent_initialization else
+                               "official_rgb_only_diagnostic" if self.rgb_diagnostic else
                                "official_rgb_pretrained_ir_supported_depth" if self.quality_fusion else
                                "official_rgb_plus_trainable_zero_ir_depth" if self.early_fusion else "rgb_plus_auxiliary_encoders",
              "checkpoint_selection": "mAP50-95",
@@ -1173,10 +1214,12 @@ class FusionDetectionTrainer(DetectionTrainer):
             destination = code / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(PROJECT_ROOT / name, destination)
-        structure = "质量感知P3融合v19" if self.quality_fusion else "分模态首层v18" if self.recipe.split_stem else "五通道首层" if self.early_fusion else "三分支门控"
+        structure = "RGB三通道诊断（非赛事提交）" if self.rgb_diagnostic else "质量感知P3融合v19" if self.quality_fusion else "分模态首层v18" if self.recipe.split_stem else "五通道首层" if self.early_fusion else "三分支门控"
         geometry = (f"原生方形{self.args.imgsz}×{self.args.imgsz}，{structure}" if self.native_square
                     else f"内容1920×1080，张量1920×1088，{structure}")
         LOGGER.info(f"融合输入：{geometry}；物理批次{self.batch_size}，有效批次{self.args.nbs}")
+        if self.recipe.budget_epochs is not None:
+            LOGGER.info(f"训练预算：第{self.recipe.budget_epochs}轮验证和保存后停止；学习率仍按{self.epochs}轮日程")
 
     def optimizer_step(self) -> None:
         if self.early_fusion:
@@ -1204,6 +1247,18 @@ class FusionDetectionTrainer(DetectionTrainer):
         fitness = float(metrics["metrics/mAP50-95(B)"])
         # 原生fitness当前也是AP95，显式锁定以免框架版本改变选择语义。
         self.best_fitness = max(self.best_fitness or 0.0, fitness)
+        epoch = self.epoch + 1
+        if self.recipe.budget_epochs is not None:
+            exhausted = epoch >= self.recipe.budget_epochs
+            append_csv(self.save_dir / "budget_history.csv", [{
+                "epoch": epoch, "schedule_epochs": self.epochs, "budget_epochs": self.recipe.budget_epochs,
+                "current_AP95": fitness, "best_AP95": self.best_fitness,
+                "decision": "stop" if exhausted else "continue",
+                "reason": "budget_exhausted" if exhausted else "within_budget",
+            }])
+            if exhausted:
+                self.stop = True
+                LOGGER.info(f"第{epoch}轮诊断预算结束：最佳AP95={self.best_fitness:.5f}；保存后停止，不判定模型最终上限")
         screening = dict(self.recipe.screening_thresholds)
         if (epoch := self.epoch + 1) in screening:
             threshold = screening[epoch]
@@ -1255,7 +1310,8 @@ class FusionDetectionTrainer(DetectionTrainer):
             weights = (torch.cat([getattr(stem, name).weight.detach().float()
                                   for name in ("rgb", "infrared", "depth")], dim=1)
                        if self.recipe.split_stem else stem.conv.weight.detach().float())
-            for channel, name in enumerate(("red", "green", "blue", "infrared", "depth")):
+            channel_names = ("red", "green", "blue") if self.rgb_diagnostic else ("red", "green", "blue", "infrared", "depth")
+            for channel, name in enumerate(channel_names):
                 diagnostics[f"stem_{name}_weight_norm"] = float(weights[:, channel].norm())
             if self.recipe.split_stem:
                 diagnostics["stem_optimizer_steps"] = self.stem_update_steps

@@ -34,6 +34,8 @@ EARLY_FUSION_VERSION: str = "yolo26l_early_rect_v10_2"
 SPLIT_STEM_VERSION: str = "yolo26l_split_stem_v18_1"
 # v19输入额外携带深度支持比例，不能用旧五通道预处理预测。
 QUALITY_FUSION_VERSION: str = "yolo26l_quality_p3_v19_1"
+# 单模态仅用于训练方向诊断，与所有赛事三模态检查点明确区分。
+RGB_DIAGNOSTIC_VERSION: str = "yolo26l_rgb_diagnostic_v20_1"
 # 协议变化不冒充模型提升；新旧权重须在同一划分、同一协议下比较。
 EVALUATION_PROTOCOL: str = "fp32_single_label_content_clip_v2"
 # 五通道顺序沿用已有数据集；真实内容框宽高与网络补齐画布分别记录。
@@ -282,6 +284,21 @@ class EarlyFusionDetectionModel(DetectionModel):
             raise ValueError("首层已拆分，不能重复转换")
         self.model[0] = SplitModalStem(self.model[0])
         self.early_fusion_version = SPLIT_STEM_VERSION
+
+
+class RGBDiagnosticModel(EarlyFusionDetectionModel):
+    """仅用于RGB对照，不作为三模态赛事提交模型。"""
+
+    def __init__(self, cfg: dict[str, Any], nc: int = 12, verbose: bool = True) -> None:
+        # 先沿用v14构建顺序，再裁掉辅助切片，避免改变未迁移检测头的随机初始化顺序。
+        super().__init__(cfg, nc, verbose)
+        first = self.model[0].conv
+        first.weight = nn.Parameter(first.weight.detach()[:, :3].clone())
+        first.in_channels = 3
+        self.model[0].np = sum(parameter.numel() for parameter in self.model[0].parameters())
+        self.yaml["channels"] = 3
+        self.early_fusion_version = RGB_DIAGNOSTIC_VERSION
+        self.diagnostic_only = True
 
 
 class FusionDetectionModel(DetectionModel):
