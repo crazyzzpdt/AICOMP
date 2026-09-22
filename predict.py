@@ -1,4 +1,4 @@
-"""批量预测 RGB、红外、深度五通道图像，并生成赛事提交 ZIP。
+"""批量预测RGB、红外、深度图，按权重版本处理质量通道并生成提交ZIP。
 
 读取、推理与保存并行调度；检测保持 FP32、单模型、训练同口径预处理。
 结果存入 images、labels、比赛提交内容三个子目录，已有输出目录不覆盖。
@@ -51,10 +51,11 @@ from ultralytics.models.yolo.detect.predict import DetectionPredictor
 from ultralytics.utils import nms, ops
 
 # 自己的模块
-from aic.data import CLASS_NAMES, IMAGE_SUFFIXES, fuse_modalities
-from aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION,
-                       EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, canvas_shape, clip_canvas_boxes,
-                       letterbox_fused, letterbox_native_fused, restore_boxes, single_label_nms)
+from aic.data import CLASS_NAMES, IMAGE_SUFFIXES, QUALITY_PREPROCESS_VERSION, fuse_modalities, fuse_quality_modalities
+from aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
+                       EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, QualityFusionDetectionModel,
+                       canvas_shape, clip_canvas_boxes, letterbox_fused, letterbox_native_fused,
+                       letterbox_native_quality, restore_boxes, single_label_nms)
 
 
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
@@ -118,13 +119,14 @@ class PredictionSample:
 
 # 一、模型后端：当前融合模型及历史D-FINE兼容
 class FusionPredictor:
-    """单次加载融合模型，对已矩形化的五通道批次执行 FP32 推理。"""
+    """单次加载融合模型，对同版本几何及通道契约的批次执行FP32推理。"""
 
     def __init__(self, model: FusionDetectionModel | EarlyFusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
         early = isinstance(model, EarlyFusionDetectionModel)
+        quality = isinstance(model, QualityFusionDetectionModel)
         version = getattr(model, "early_fusion_version" if early else "fusion_version", None)
         split_stem = early and isinstance(model.model[0], SplitModalStem)
-        expected = SPLIT_STEM_VERSION if split_stem else EARLY_FUSION_VERSION if early else FUSION_VERSION
+        expected = QUALITY_FUSION_VERSION if quality else SPLIT_STEM_VERSION if split_stem else EARLY_FUSION_VERSION if early else FUSION_VERSION
         if version != expected or tuple(getattr(model, "content_hw", ())) != tuple(content_hw):
             raise ValueError(f"权重版本{version}、高宽{getattr(model, 'content_hw', None)}不匹配；请使用对应源码和预测尺寸")
         self.device = torch.device("cpu" if str(device) == "cpu" else f"cuda:{int(device)}")
@@ -133,13 +135,24 @@ class FusionPredictor:
         self.names = model.names
         self.content_hw = content_hw
         self.version = version
-        self.architecture = "split_stem_v18" if split_stem else "early_fusion" if early else "gated_fusion"
-        recipe = getattr(model, "fusion_training", {}).get("signature", {}).get("recipe", {})
+        self.architecture = "quality_v19" if quality else "split_stem_v18" if split_stem else "early_fusion" if early else "gated_fusion"
+        signature = getattr(model, "fusion_training", {}).get("signature", {})
+        recipe = signature.get("recipe", {})
         self.geometry = recipe.get("geometry", "fixed_rect")
         if self.geometry not in {"native_square", "fixed_rect"}:
             raise ValueError(f"未知的训练预处理几何：{self.geometry}")
         if self.geometry == "native_square" and content_hw[0] != content_hw[1]:
             raise ValueError("原生方形权重要求height与imgsz一致")
+        self.quality_preprocessing = signature.get("quality_preprocessing", {}) if quality else {}
+        if quality and (getattr(model, "preprocess_version", None) != QUALITY_PREPROCESS_VERSION or
+                self.quality_preprocessing.get("version") != QUALITY_PREPROCESS_VERSION or
+                self.quality_preprocessing.get("input_channels") != 6 or
+                signature.get("version") != QUALITY_FUSION_VERSION or
+                recipe.get("architecture") != "quality_v19" or self.geometry != "native_square" or
+                signature.get("evaluation_protocol") != EVALUATION_PROTOCOL):
+            raise ValueError("v19检查点的六通道支持掩码/几何/验证协议不一致，拒绝套用旧预测路径")
+        self.input_geometry = "quality_native" if quality else self.geometry
+        self.padding_values = [114, 114, 114, 0, 0, 0] if quality else [114] * 5 if self.geometry == "native_square" else [114, 114, 114, 0, 0]
 
     @torch.inference_mode()
     def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
@@ -337,7 +350,7 @@ def collect_samples(source: Path) -> list[tuple[Path, Path, Path]]:
 
 
 def validate_model(model: YOLO) -> None:
-    """只接受本项目的五通道、12 类本地检测权重。
+    """只接受本项目的三模态、12类本地检测权重，包括v19派生支持通道。
 
     Args:
         model: 已从本地检查点加载的 YOLO 模型。
@@ -355,7 +368,7 @@ def validate_model(model: YOLO) -> None:
     if model.names != dict(enumerate(CLASS_NAMES)):
         raise ValueError(f"模型类别编号与比赛 12 类不一致：{model.names}")
     # 框架图片加载器从 YAML 读取通道数，缺省的 3 会把五通道数组裁掉后两通道。
-    model.model.yaml["channels"] = 5
+    model.model.yaml["channels"] = 6 if isinstance(model.model, QualityFusionDetectionModel) else 5
 
 
 # 三、五通道预测与原图坐标恢复
@@ -484,13 +497,16 @@ def predict_yolo_batch(model: YOLO, images: list[np.ndarray], config: Prediction
 def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: int, height: int = 1080,
                            fusion_geometry: str = "fixed_rect") -> PredictionSample:
     """在读取线程中融合模态，并完成相应后端的同步缩放与填充。"""
-    fused = fuse_modalities(*paths)
-    if fused.dtype != np.uint8 or fused.ndim != 3 or fused.shape[2] != 5:
-        raise ValueError(f"预测输入必须是 uint8 五通道图：{paths[0].name}")
+    quality = backend == "fusion" and fusion_geometry == "quality_native"
+    fused = fuse_quality_modalities(*paths) if quality else fuse_modalities(*paths)
+    channels = 6 if quality else 5
+    if fused.dtype != np.uint8 or fused.ndim != 3 or fused.shape[2] != channels:
+        raise ValueError(f"预测输入必须是 uint8 {channels}通道图：{paths[0].name}")
     if backend == "yolo":
         return PredictionSample(paths[0], fused, None, {})
     if backend == "fusion":
-        canvas, geometry = (letterbox_native_fused(fused, imgsz) if fusion_geometry == "native_square"
+        canvas, geometry = (letterbox_native_quality(fused, imgsz) if quality else
+                            letterbox_native_fused(fused, imgsz) if fusion_geometry == "native_square"
                             else letterbox_fused(fused, (height, imgsz)))
     else:
         canvas, geometry = resize_dfine_fused(fused, imgsz)
@@ -767,8 +783,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             fusion_epoch = int(model.ckpt["epoch"]) + 1
             model = FusionPredictor(model.model, config.device, (config.height, config.imgsz))
             print(f"融合模型FP32批量预测：内容{config.imgsz}×{config.height}；张量高宽{canvas_shape(model.content_hw)}")
-            print(f"检查点预处理：{model.geometry}；五通道补边="
-                  f"{[114] * 5 if model.geometry == 'native_square' else [114, 114, 114, 0, 0]}")
+            print(f"检查点预处理：{model.input_geometry}；通道补边={model.padding_values}")
         elif backend == "fusion":
             raise ValueError("--backend fusion要求带项目几何元数据的v9及后续模型，不能用于历史v4五通道权重")
         else:
@@ -789,7 +804,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
     try:
         with ThreadPoolExecutor(max_workers=config.workers, thread_name_prefix="模态读取") as reader, \
                 ThreadPoolExecutor(max_workers=config.save_workers, thread_name_prefix="结果保存") as writer:
-            for batch in prediction_batches(samples, config, reader, getattr(model, "geometry", "fixed_rect")):
+            for batch in prediction_batches(samples, config, reader, getattr(model, "input_geometry", "fixed_rect")):
                 groups: dict[tuple[int, ...], list[PredictionSample]] = {}
                 for sample in batch:
                     # 融合与D-FINE已统一各自画布；旧YOLO按原尺寸分组。
@@ -842,8 +857,10 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                          "tensor_hw": list(canvas_shape(model.content_hw)), "height": config.height,
                          "yolo_profile": None, "postprocess": "shared_single_label_nms",
                          "rect": False, "validation_geometry": model.geometry,
-                         "padding_values": [114] * 5 if model.geometry == "native_square" else [114, 114, 114, 0, 0],
-                         "preprocess": "native_square_ceil_pad114_div255_v1" if model.geometry == "native_square" else "fixed_rectangle_rgbirdepth_div255",
+                         "padding_values": model.padding_values,
+                         "preprocess": QUALITY_PREPROCESS_VERSION if model.architecture == "quality_v19" else
+                                       "native_square_ceil_pad114_div255_v1" if model.geometry == "native_square" else "fixed_rectangle_rgbirdepth_div255",
+                         "quality_preprocessing": model.quality_preprocessing,
                          "effective_model_batch": config.batch,
                          "weights_kind": "ema"})
     else:

@@ -1,4 +1,4 @@
-"""提供YOLO26l五通道早期融合、历史门控结构及共用几何处理。
+"""提供YOLO26l质量感知融合、历史五通道结构及共用几何处理。
 
 模型类别保持可导入，保证本地检查点在 Windows 子进程与 predict.py 中恢复。
 只有正式训练或预测入口会执行前向，本模块导入不加载权重或启动训练。
@@ -16,10 +16,14 @@ import cv2
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from ultralytics.data.augment import LetterBox
 from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import nms
 from ultralytics.utils.loss import E2ELoss
+
+# 自己的模块
+from .data import QUALITY_PREPROCESS_VERSION, resize_quality_image
 
 
 # 结构和预处理共同版本化，不把旧五通道首层模型当作新分支模型。
@@ -28,6 +32,8 @@ FUSION_VERSION: str = "yolo26l_gated_rect_v9_1"
 EARLY_FUSION_VERSION: str = "yolo26l_early_rect_v10_2"
 # 首层参数路径改变，须与旧五通道整块卷积区分恢复。
 SPLIT_STEM_VERSION: str = "yolo26l_split_stem_v18_1"
+# v19输入额外携带深度支持比例，不能用旧五通道预处理预测。
+QUALITY_FUSION_VERSION: str = "yolo26l_quality_p3_v19_1"
 # 协议变化不冒充模型提升；新旧权重须在同一划分、同一协议下比较。
 EVALUATION_PROTOCOL: str = "fp32_single_label_content_clip_v2"
 # 五通道顺序沿用已有数据集；真实内容框宽高与网络补齐画布分别记录。
@@ -67,6 +73,36 @@ def letterbox_native_fused(image: np.ndarray, imgsz: int) -> tuple[np.ndarray, t
     resized = resize_native_fused(image, imgsz)
     new_height, new_width = resized.shape[:2]
     canvas = LetterBox(new_shape=(imgsz, imgsz), auto=False, scaleup=False, padding_value=114)(image=resized)
+    return canvas, (new_width / width, new_height / height, (imgsz - new_width) // 2, (imgsz - new_height) // 2)
+
+
+class QualityLetterBox(LetterBox):
+    """复用原生标签几何，只有v19图像插值和辅助补边改为质量感知处理。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        image = resize_quality_image(labels["img"], tuple(params["new_unpad"]))
+        height, width = image.shape[:2]
+        top, left = params["top"], params["left"]
+        canvas = np.zeros((height + top + params["bottom"], width + left + params["right"], 6), dtype=np.uint8)
+        canvas[:, :, :3] = 114
+        canvas[top:top + height, left:left + width] = image
+        labels["img"], labels["resized_shape"] = canvas, params["new_shape"]
+        return labels
+
+
+def resize_native_quality(image: np.ndarray, imgsz: int) -> np.ndarray:
+    """v19沿用原生长边与ceil取整，只改变深度插值语义。"""
+    height, width = image.shape[:2]
+    ratio = imgsz / max(height, width)
+    return resize_quality_image(image, (min(int(np.ceil(width * ratio)), imgsz), min(int(np.ceil(height * ratio)), imgsz)))
+
+
+def letterbox_native_quality(image: np.ndarray, imgsz: int) -> tuple[np.ndarray, tuple[float, float, int, int]]:
+    """预测复用v19数据集相同的长边缩放与LetterBox。"""
+    height, width = image.shape[:2]
+    resized = resize_native_quality(image, imgsz)
+    new_height, new_width = resized.shape[:2]
+    canvas = QualityLetterBox(new_shape=(imgsz, imgsz), auto=False, scaleup=False)(image=resized)
     return canvas, (new_width / width, new_height / height, (imgsz - new_width) // 2, (imgsz - new_height) // 2)
 
 
@@ -291,6 +327,125 @@ class FusionDetectionModel(DetectionModel):
     def init_criterion(self) -> FixedHeadLoss:
         """双头训练与选择哪一个预测头相互独立。"""
         return FixedHeadLoss(self)
+
+
+class LocalInfraredResidual(nn.Module):
+    """在P3的3×3邻域匹配红外特征，不做全图注意力或全图平移。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # RGB/IR都来自同一预训练前五层，用共享投影比较局部结构。
+        self.context = nn.Conv2d(512, 8, 1, bias=False)
+        self.value = nn.Conv2d(512, 64, 1, bias=False)
+        self.project = nn.Conv2d(64, 512, 1, bias=False)
+        self.gate = nn.Sequential(nn.Conv2d(16, 1, 1), nn.Sigmoid())
+        nn.init.normal_(self.project.weight, std=0.001)
+        nn.init.zeros_(self.gate[0].weight)
+        nn.init.constant_(self.gate[0].bias, -2.0)
+        self.last_gate_mean: torch.Tensor | None = None
+        self.last_center_weight: torch.Tensor | None = None
+
+    def forward(self, rgb: torch.Tensor, infrared: torch.Tensor) -> torch.Tensor:
+        """软对应只在一个特征格邻域内，边界候选显式屏蔽而非循环回绕。"""
+        query, key = self.context(rgb), self.context(infrared)
+        height, width = query.shape[-2:]
+        query_unit, key_unit = F.normalize(query.float(), dim=1), F.normalize(key.float(), dim=1)
+        neighbors = F.unfold(key_unit, kernel_size=3, padding=1).reshape(rgb.shape[0], 8, 9, height, width)
+        logits = (query_unit.unsqueeze(2) * neighbors).sum(1)
+        # 同位置有固定先验；偏移只能±1个P3格（输入8像素），不宣称完成传感器标定。
+        prior = logits.new_zeros((1, 9, 1, 1))
+        prior[:, 4] = 2.0
+        valid = F.unfold(torch.ones_like(key_unit[:1, :1]), kernel_size=3, padding=1).reshape(1, 9, height, width)
+        attention = (logits + prior).masked_fill(valid == 0, -1e4).softmax(dim=1)
+        values = self.value(infrared)
+        padded = F.pad(values, (1, 1, 1, 1))
+        matched = torch.zeros_like(values)
+        # 逐偏移累加，避免展开64通道×9邻域的大张量。
+        for index in range(9):
+            dy, dx = divmod(index, 3)
+            matched = matched + padded[:, :, dy:dy + height, dx:dx + width] * attention[:, index:index + 1].to(values.dtype)
+        gate = self.gate(torch.cat((query, key), dim=1))
+        if self.training:
+            self.last_gate_mean = gate.detach().float().mean()
+            self.last_center_weight = attention[:, 4].detach().mean()
+        return self.project(matched) * gate
+
+
+class SupportedDepthEncoder(nn.Module):
+    """把距离与支持比例共同编码为P3特征，缺测不伪装成近距离。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        channels = (2, 32, 48, 64)
+        self.stages = nn.Sequential(*[nn.Sequential(
+            nn.Conv2d(source, target, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, target), nn.SiLU(),
+        ) for source, target in zip(channels[:-1], channels[1:])])
+
+    def forward(self, depth_and_support: torch.Tensor) -> torch.Tensor:
+        return self.stages(depth_and_support)
+
+
+class QualityFusionDetectionModel(FusionDetectionModel):
+    """v19保留RGB定位主干，仅在进入颈部的P3加入质量感知三模态残差。"""
+
+    def __init__(self, cfg: dict[str, Any], nc: int = 12, verbose: bool = True) -> None:
+        # 不构建历史v9随机三尺度分支；初始化步长仍由父类RGB路径推导。
+        DetectionModel.__init__(self, deepcopy(cfg), ch=3, nc=nc, verbose=verbose)
+        if self.yaml.get("scale") != "l" or len(self.model) != 24:
+            raise ValueError("v19只支持官方YOLO26l的24层结构")
+        self.ir_encoder = deepcopy(self.model[:5])
+        first = self.ir_encoder[0].conv
+        first.in_channels = 1
+        first.weight = nn.Parameter(first.weight.detach().sum(dim=1, keepdim=True))
+        self.depth_encoder = SupportedDepthEncoder()
+        self.ir_fusion = LocalInfraredResidual()
+        self.depth_fusion = GatedResidual(64, 512)
+        self.fusion_version = QUALITY_FUSION_VERSION
+        self.preprocess_version = QUALITY_PREPROCESS_VERSION
+        self.content_hw = (1280, 1280)
+        self.yaml["channels"] = 6
+        self.end2end = False
+        self.last_support_mean: torch.Tensor | None = None
+
+    def initialize_auxiliary_from_rgb(self) -> None:
+        """官方RGB迁移完成后复制兼容参数，不把随机构建参数当作预训练。
+
+        Note:
+            IR第0–4层除首层通道求和外完整继承RGB；Depth只继承首层前32个
+            RGB滤波器的通道和，支持通道权重置零可训练，其余深度层随机初始化。
+        """
+        state = {name: value.detach().clone() for name, value in self.model[:5].state_dict().items()}
+        state["0.conv.weight"] = state["0.conv.weight"].sum(dim=1, keepdim=True)
+        self.ir_encoder.load_state_dict(state, strict=True)
+        with torch.no_grad():
+            conv = self.depth_encoder.stages[0][0]
+            conv.weight[:, :1].copy_(self.model[0].conv.weight[:32].sum(dim=1, keepdim=True))
+            conv.weight[:, 1:].zero_()
+
+    def _predict_once(self, x: torch.Tensor, profile: bool = False,
+                      embed: list[int] | None = None) -> Any:
+        """仅替换供颈部使用的P3，RGB主干P4/P5不先被辅助模态改写。"""
+        if not hasattr(self, "ir_encoder"):
+            return DetectionModel._predict_once(self, x, profile=profile, embed=embed)
+        if x.ndim != 4 or x.shape[1] != 6 or profile or embed is not None:
+            raise ValueError("v19要求RGB3+IR1+Depth1+Support1，不支持旧五通道或embed/profile")
+        infrared = self.ir_encoder(x[:, 3:4])
+        support = F.adaptive_avg_pool2d(x[:, 5:6].float(), infrared.shape[-2:]).to(infrared.dtype)
+        depth = self.depth_encoder(torch.cat((x[:, 4:5] * x[:, 5:6], x[:, 5:6]), dim=1))
+        if self.training:
+            self.last_support_mean = support.detach().float().mean()
+        x = x[:, :3]
+        saved: list[Any] = []
+        for layer in self.model:
+            if layer.f != -1:
+                x = saved[layer.f] if isinstance(layer.f, int) else [x if j == -1 else saved[j] for j in layer.f]
+            x = layer(x)
+            saved.append(x if layer.i in self.save else None)
+            if layer.i == 10:
+                rgb = saved[4]
+                saved[4] = rgb + self.ir_fusion(rgb, infrared) + support * self.depth_fusion(rgb, depth)
+        return x
 
 
 # 历史v9权重记录中文模块名；在入口加载权重前注册别名，不保留空壳转发文件。

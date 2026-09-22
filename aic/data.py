@@ -2,6 +2,7 @@
 
 # 内置库
 import hashlib
+from collections.abc import Callable
 from pathlib import Path
 
 # 三方库
@@ -27,6 +28,10 @@ CLASS_NAMES: tuple[str, ...] = (
 
 # 沿用既有毫米深度上限，训练与预测使用同一换算。
 DEPTH_MAX_MM: int = 20_000
+# 仅用于v19原始毫米深度支持判断；JPG灰度不套用距离阈值。
+DEPTH_MIN_MM: int = 300
+# 六个张量通道仍来自三种传感器，第六通道是深度派生的支持比例。
+QUALITY_PREPROCESS_VERSION: str = "rgbirdepth_support_weighted_uint8_v19_1"
 
 
 def file_hash(path: Path) -> str:
@@ -134,7 +139,63 @@ def fuse_modalities(visible_path: Path, infrared_path: Path, depth_path: Path) -
     infrared_channel = convert_to_single_channel(infrared)
     depth_channel = normalize_depth_channel(depth)
 
-    # 官方同名三模态已对齐；尺寸异常应报告，不能通过拉伸掩盖错配。
+    # 同名同尺寸只确认样本配对，不能据此证明像素级对齐；异常不能靠拉伸掩盖。
     if not visible.shape[:2] == infrared_channel.shape[:2] == depth_channel.shape[:2]:
         raise ValueError(f"三模态尺寸不一致：{visible_path.name}")
     return np.dstack((visible, infrared_channel, depth_channel))
+
+
+def fuse_quality_modalities(visible_path: Path, infrared_path: Path, depth_path: Path) -> np.ndarray:
+    """从原始深度生成支持掩码，再组成RGB、IR、Depth、支持比例六通道。
+
+    Note:
+        原始PNG有效范围为[300,20000]毫米；JPG非零仅是可用性代理。
+        不更改源图，不对全零深度伪造数据，旧权重仍使用fuse_modalities。
+    """
+    if len({visible_path.name, infrared_path.name, depth_path.name}) != 1:
+        raise ValueError("三模态必须使用同名样本，不能混合不同帧")
+    visible = cv2.cvtColor(read_image(visible_path, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    infrared = convert_to_single_channel(read_image(infrared_path, cv2.IMREAD_UNCHANGED))
+    raw_depth = convert_to_single_channel(read_image(depth_path, cv2.IMREAD_UNCHANGED))
+    if not visible.shape[:2] == infrared.shape == raw_depth.shape or infrared.dtype != np.uint8:
+        raise ValueError(f"v19要求同尺寸RGB/8位IR/深度：{visible_path.name}")
+    if raw_depth.dtype == np.uint16:
+        support = (raw_depth >= DEPTH_MIN_MM) & (raw_depth <= DEPTH_MAX_MM)
+    elif raw_depth.dtype == np.uint8:
+        support = raw_depth > 0
+    else:
+        raise ValueError(f"不支持的深度类型：{raw_depth.dtype}")
+    depth = normalize_depth_channel(raw_depth)
+    depth = np.where(support, depth, 0).astype(np.uint8)
+    return np.dstack((visible, infrared, depth, support.astype(np.uint8) * 255))
+
+
+def transform_quality_image(image: np.ndarray, operation: Callable[[np.ndarray, float], np.ndarray]) -> np.ndarray:
+    """同步变换六通道，以支持加权插值避免缺测零拉低有效深度。
+
+    Args:
+        image: uint8 RGB3+IR1+Depth1+Support1，支持通道255表示完全支持。
+        operation: 接受单通道浮点图与边界值的同一几何变换。
+
+    Returns:
+        六通道uint8；支持是插值后的比例而非重新阈值化的二值掩码。
+    """
+    if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 6:
+        raise ValueError("v19几何处理要求uint8六通道输入")
+    support = image[:, :, 5].astype(np.float32) / 255.0
+    transformed_support = np.clip(operation(support, 0.0), 0.0, 1.0)
+    numerator = operation(image[:, :, 4].astype(np.float32) * support, 0.0)
+    depth = np.divide(numerator, transformed_support, out=np.zeros_like(numerator), where=transformed_support > 1e-6)
+    mask = np.rint(transformed_support * 255).astype(np.uint8)
+    depth[mask == 0] = 0
+    planes = [np.clip(operation(image[:, :, i].astype(np.float32), 114.0 if i < 3 else 0.0), 0, 255)
+              for i in range(4)]
+    return np.dstack((*[np.rint(plane).astype(np.uint8) for plane in planes],
+                      np.rint(np.clip(depth, 0, 255)).astype(np.uint8), mask))
+
+
+def resize_quality_image(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+    """使用共同双线性几何缩放RGB/IR与支持加权深度。"""
+    if image.shape[:2] == size_wh[::-1]:
+        return image
+    return transform_quality_image(image, lambda plane, border: cv2.resize(plane, size_wh, interpolation=cv2.INTER_LINEAR))

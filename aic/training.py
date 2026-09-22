@@ -1,4 +1,4 @@
-"""以原生YOLO训练循环执行五通道早期融合，兼容历史门控结构。
+"""以原生YOLO训练循环执行三模态融合，支持深度质量输入及历史结构。
 
 main.py 是唯一训练入口；此模块不独立运行，也不启动测试或显存探测。
 正式轮末验证复用同一批预测计算分域指标，不附加独立模型评估。
@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 import torch
 import ultralytics
-from ultralytics.data.augment import Compose
+from ultralytics.data.augment import Compose, LetterBox, Mosaic, RandomPerspective
 from ultralytics.data.build import InfiniteDataLoader, seed_worker
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import get_hash
@@ -40,10 +40,13 @@ from ultralytics.utils.metrics import ConfusionMatrix, DetMetrics, plot_mc_curve
 from ultralytics.utils.torch_utils import unwrap_model
 
 # 自己的模块
-from .model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION,
-                    EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem,
-                    canvas_shape, clip_canvas_boxes, letterbox_fused, resize_channels, resize_native_fused, single_label_nms)
-from .data import CLASS_NAMES, IMAGE_SUFFIXES, file_hash, fuse_modalities, verify_source_images
+from .model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
+                    EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, QualityFusionDetectionModel, QualityLetterBox,
+                    canvas_shape, clip_canvas_boxes, letterbox_fused, resize_channels, resize_native_fused,
+                    resize_native_quality, single_label_nms)
+from .data import (CLASS_NAMES, IMAGE_SUFFIXES, QUALITY_PREPROCESS_VERSION, DEPTH_MIN_MM, DEPTH_MAX_MM,
+                   file_hash, fuse_modalities, fuse_quality_modalities, resize_quality_image,
+                   transform_quality_image, verify_source_images)
 
 
 # 历史主训练默认至少二十轮；显式短收尾可单独设置，最佳权重始终按真实AP95保存。
@@ -71,6 +74,8 @@ def resolve_modality_directory(data: dict[str, object], modality: str, img_path:
 
 class MultimodalYOLODataset(YOLODataset):
     """读取同名 RGB、红外、深度图并交给 Ultralytics 检测增强流程。"""
+
+    input_channels: int = 5
 
     def __init__(self, *args: object, data: dict[str, object], polish_scale: float | None = None,
                  polish_translate: float | None = None, **kwargs: object) -> None:
@@ -125,6 +130,14 @@ class MultimodalYOLODataset(YOLODataset):
             self.depth_dir / visible_path.name,
         )
 
+    def resize_image(self, image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+        """历史数据集保持原插值；v19覆盖此接口处理深度支持。"""
+        return resize_channels(image, size_wh)
+
+    def resize_native_image(self, image: np.ndarray) -> np.ndarray:
+        """历史权重的原生长边缩放保持不变。"""
+        return resize_native_fused(image, self.imgsz)
+
     def cache_images_to_disk(self, index: int) -> None:
         """将五通道融合图写入 NPY 缓存，避免后续反复解码三个源文件。"""
         cache_path = self.npy_files[index]
@@ -154,8 +167,8 @@ class MultimodalYOLODataset(YOLODataset):
             if self.cache == "disk" and self.cache_is_current(index):
                 try:
                     image = np.load(cache_path, allow_pickle=False)
-                    if image.ndim != 3 or image.shape[2] != 5:
-                        raise ValueError(f"缓存通道数为 {image.shape[-1] if image.ndim >= 3 else 1}，期望为 5")
+                    if image.ndim != 3 or image.shape[2] != self.input_channels:
+                        raise ValueError(f"缓存通道数不符合当前输入契约：期望 {self.input_channels}")
                 except Exception as error:
                     LOGGER.warning(f"{self.prefix}移除失效三模态缓存 {cache_path}：{error}")
                     cache_path.unlink(missing_ok=True)
@@ -173,11 +186,11 @@ class MultimodalYOLODataset(YOLODataset):
                             if height_original < width_original
                             else (self.imgsz, math.ceil(height_original * ratio))
                         )
-                        image = resize_channels(image, (width, height))
+                        image = self.resize_image(image, (width, height))
                 else:
-                    image = resize_native_fused(image, self.imgsz)
+                    image = self.resize_native_image(image)
             elif not (height_original == width_original == self.imgsz):
-                image = resize_channels(image, (self.imgsz, self.imgsz))
+                image = self.resize_image(image, (self.imgsz, self.imgsz))
 
             if self.augment and self.cache != "ram":
                 self.ims[index] = image
@@ -199,6 +212,71 @@ class MultimodalYOLODataset(YOLODataset):
         if self.polish_translate is not None:
             hyp.translate = self.polish_translate
         super().close_mosaic(hyp)
+
+
+class QualityMosaic(Mosaic):
+    """保留原生四图布局与标签变换，空白区只有RGB填114。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params is None or self.n != 4:
+            raise ValueError("v19只支持带布局参数的四图Mosaic")
+        canvas = np.zeros((self.imgsz * 2, self.imgsz * 2, 6), dtype=np.uint8)
+        canvas[:, :, :3] = 114
+        for item in params["layout"]:
+            image = item["labels_patch"]["img"]
+            canvas[item["y1a"]:item["y2a"], item["x1a"]:item["x2a"]] = image[item["y1b"]:item["y2b"], item["x1b"]:item["x2b"]]
+        labels["img"] = canvas
+        return labels
+
+
+class QualityRandomPerspective(RandomPerspective):
+    """复用原生随机矩阵和目标筛选，只替换图像插值与补边。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params is None:
+            raise ValueError("缺少同步几何变换参数")
+        matrix, size = params["M"], params["size"]
+        operation = (lambda plane, border: cv2.warpPerspective(plane, matrix, dsize=size, borderValue=border)) if self.perspective else (
+            lambda plane, border: cv2.warpAffine(plane, matrix[:2], dsize=size, borderValue=border))
+        labels["img"] = transform_quality_image(labels["img"], operation)
+        labels["resized_shape"] = labels["img"].shape[:2]
+        return labels
+
+
+class QualityYOLODataset(MultimodalYOLODataset):
+    """只为v19派生支持通道，磁盘data.yaml继续表达五个传感器通道。"""
+
+    input_channels: int = 6
+
+    def load_fused_image(self, index: int) -> np.ndarray:
+        path = Path(self.im_files[index])
+        return fuse_quality_modalities(path, self.infrared_dir / path.name, self.depth_dir / path.name)
+
+    def resize_image(self, image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+        return resize_quality_image(image, size_wh)
+
+    def resize_native_image(self, image: np.ndarray) -> np.ndarray:
+        return resize_native_quality(image, self.imgsz)
+
+    def build_transforms(self, hyp: Any = None) -> Compose:
+        """沿用本机原生增强图，仅替换三个负责插值或填充的节点。"""
+        transforms = super().build_transforms(hyp)
+
+        def replace_geometry(composition: Compose) -> None:
+            for index, transform in enumerate(composition.transforms):
+                if isinstance(transform, Compose):
+                    replace_geometry(transform)
+                elif isinstance(transform, Mosaic):
+                    composition.transforms[index] = QualityMosaic(self, imgsz=self.imgsz, p=hyp.mosaic, n=4)
+                elif isinstance(transform, RandomPerspective):
+                    composition.transforms[index] = QualityRandomPerspective(
+                        degrees=hyp.degrees, translate=hyp.translate, scale=hyp.scale,
+                        shear=hyp.shear, perspective=hyp.perspective, size=(self.imgsz, self.imgsz))
+                elif isinstance(transform, LetterBox):
+                    composition.transforms[index] = QualityLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)
+
+        replace_geometry(transforms)
+        return transforms
 
 
 def learning_rate_factor(epoch: int, decay_epochs: int, final_ratio: float, cosine: bool) -> float:
@@ -635,15 +713,18 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def __init__(self, *args: Any, recipe: FusionRecipe, **kwargs: Any) -> None:
         self.recipe = recipe
-        if recipe.architecture not in {"gated_v9", "early_v10"}:
+        if recipe.architecture not in {"gated_v9", "early_v10", "quality_v19"}:
             raise ValueError("未知三模态融合配方")
         if recipe.geometry not in {"fixed_rect", "native_square"}:
             raise ValueError("未知输入几何配方")
         self.early_fusion = recipe.architecture == "early_v10"
+        self.quality_fusion = recipe.architecture == "quality_v19"
         self.native_square = recipe.geometry == "native_square"
         self.recipe_version = EARLY_FUSION_VERSION if self.early_fusion else FUSION_VERSION
         if recipe.split_stem:
             self.recipe_version = SPLIT_STEM_VERSION
+        if self.quality_fusion:
+            self.recipe_version = QUALITY_FUSION_VERSION
         self.requested = dict(kwargs.get("overrides") or {})
         self.resume_metadata: dict[str, Any] | None = None
         self.parent_initialization: dict[str, Any] | None = None
@@ -666,8 +747,15 @@ class FusionDetectionTrainer(DetectionTrainer):
         screening_epochs = [epoch for epoch, _ in recipe.screening_thresholds]
         if screening_epochs != sorted(set(screening_epochs)):
             raise ValueError("阶段筛选轮次须严格递增且不能重复")
-        if recipe.early_backbone_lr is not None and (not self.early_fusion or not 0 < recipe.early_backbone_lr <= self.args.lr0):
-            raise ValueError("early_backbone_lr仅用于早期融合，且须为不超过lr0的正数")
+        if recipe.early_backbone_lr is not None and (not (self.early_fusion or self.quality_fusion) or
+                not 0 < recipe.early_backbone_lr <= self.args.lr0):
+            raise ValueError("early_backbone_lr仅用于原生早期/质量融合，且须为不超过lr0的正数")
+        if self.quality_fusion and (not self.native_square or recipe.split_stem or recipe.training_stage != "main" or
+                recipe.repeat_threshold != 0 or recipe.early_backbone_lr is None or self.args.compile or
+                not math.isfinite(recipe.auxiliary_lr) or recipe.auxiliary_lr <= 0 or
+                self.args.augmentations is not None or any(getattr(self.args, key) != 0 for key in (
+                    "mixup", "cutmix", "copy_paste", "hsv_h", "hsv_s", "hsv_v", "bgr"))):
+            raise ValueError("v19要求原生main、显式骨干/辅助学习率、无拆分首层/采样/颜色/混合增强/编译")
         if recipe.split_stem and (not self.early_fusion or not self.native_square or
                 recipe.training_stage != "main" or recipe.repeat_threshold != 0 or self.args.cls_pw != 0 or
                 self.args.compile or recipe.early_backbone_lr is None or
@@ -787,7 +875,7 @@ class FusionDetectionTrainer(DetectionTrainer):
         if weights is None:
             raise ValueError("请从本地官方YOLO26l预训练权重创建融合模型")
         source = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights
-        model_type = EarlyFusionDetectionModel if self.early_fusion else FusionDetectionModel
+        model_type = QualityFusionDetectionModel if self.quality_fusion else EarlyFusionDetectionModel if self.early_fusion else FusionDetectionModel
         model = self.set_model_names_for_load(model_type(cfg or source.yaml, self.data["nc"], verbose))
         if self.recipe.training_stage == "polish":
             # cls_remap=False只禁止重排分类权重，不能把真实类名留为构建器的数字占位名。
@@ -796,6 +884,8 @@ class FusionDetectionTrainer(DetectionTrainer):
         if source_version:
             if source_version != self.recipe_version:
                 raise ValueError("融合检查点结构版本与当前配方不一致")
+            if self.quality_fusion and getattr(source, "preprocess_version", None) != QUALITY_PREPROCESS_VERSION:
+                raise ValueError("v19断点缺少一致的深度支持预处理版本")
             if not self.resume and self.recipe.training_stage == "polish":
                 self.parent_initialization = self._load_polish_weights(model, source)
                 model.content_hw = (self.recipe.image_height, self.recipe.image_width)
@@ -815,7 +905,10 @@ class FusionDetectionTrainer(DetectionTrainer):
                 raise ValueError("首训只接受官方RGB预训练，不能恢复旧五通道或D-FINE模型")
         load_source = copy(source)
         load_source.names = {key: "ball" if str(name).lower() == "sports ball" else name for key, name in source.names.items()}
-        if self.recipe.split_stem and self.resume:
+        if self.quality_fusion and self.resume:
+            model.load_state_dict(load_source.float().state_dict(), strict=True)
+            model.pt_path = getattr(load_source, "pt_path", None)
+        elif self.recipe.split_stem and self.resume:
             # 新参数路径必须在加载前建立，不用宽松交集悄悄丢弃首层。
             model.split_modal_stem()
             model.load_state_dict(load_source.float().state_dict(), strict=True)
@@ -824,6 +917,9 @@ class FusionDetectionTrainer(DetectionTrainer):
             model.load(load_source, verbose=verbose)
             if self.recipe.split_stem:
                 model.split_modal_stem()
+            if self.quality_fusion:
+                model.initialize_auxiliary_from_rgb()
+                LOGGER.info("v19迁移：IR第0–4层继承RGB（首层通道求和）；Depth首层32个值滤波器继承RGB，支持权重零初始化可训练")
         model.content_hw = (self.recipe.image_height, self.recipe.image_width)
         if self.resume_metadata:
             model.fusion_training = deepcopy(self.resume_metadata)
@@ -885,7 +981,8 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None) -> MultimodalYOLODataset:
         if self.native_square:
-            return MultimodalYOLODataset(
+            dataset_type = QualityYOLODataset if self.quality_fusion else MultimodalYOLODataset
+            return dataset_type(
                 img_path=img_path, imgsz=self.args.imgsz, batch_size=batch,
                 augment=mode == "train", hyp=copy(self.args), rect=False, cache=False,
                 single_cls=False, stride=32, pad=0.0, prefix=f"{mode}: ", task="detect",
@@ -958,7 +1055,7 @@ class FusionDetectionTrainer(DetectionTrainer):
     def build_optimizer(self, model: torch.nn.Module, name: str = "AdamW", lr: float = 0.001,
                         momentum: float = 0.9, decay: float = 1e-5, iterations: float = 1e5) -> torch.optim.Optimizer:
         """将参数按主干/检测器/新增分支及衰减规则分组，预热保持学习率比例。"""
-        if self.early_fusion:
+        if self.early_fusion or self.quality_fusion:
             optimizer = super().build_optimizer(model, name=name, lr=lr, momentum=momentum, decay=decay, iterations=iterations)
             if self.recipe.early_backbone_lr is None:
                 return optimizer
@@ -967,24 +1064,29 @@ class FusionDetectionTrainer(DetectionTrainer):
             backbone_ids = {id(p) for module in native.model[1:11] for p in module.parameters()}
             auxiliary_ids = ({id(p) for module in (native.model[0].infrared, native.model[0].depth)
                               for p in module.parameters()} if self.recipe.split_stem else set())
+            if self.quality_fusion:
+                backbone_ids.update(id(p) for p in native.ir_encoder.parameters())
+                auxiliary_ids = {id(p) for module in (native.depth_encoder, native.ir_fusion, native.depth_fusion)
+                                 for p in module.parameters()}
+            auxiliary_role = "quality_auxiliary" if self.quality_fusion else "auxiliary_stem"
             rates = {"backbone": self.recipe.early_backbone_lr, "stem_neck_head": lr}
-            if self.recipe.split_stem:
-                rates["auxiliary_stem"] = self.recipe.auxiliary_lr
+            if self.recipe.split_stem or self.quality_fusion:
+                rates[auxiliary_role] = self.recipe.auxiliary_lr
             parameter_groups: list[dict[str, Any]] = []
             for group in optimizer.param_groups:
                 for role, rate in rates.items():
                     members = [p for p in group["params"] if
                                ("backbone" if id(p) in backbone_ids else
-                                "auxiliary_stem" if id(p) in auxiliary_ids else "stem_neck_head") == role]
+                                auxiliary_role if id(p) in auxiliary_ids else "stem_neck_head") == role]
                     if members:
                         parameter_groups.append({**{key: value for key, value in group.items() if key != "params"},
                                                  "params": members, "lr": rate, "initial_lr": rate, "role": role})
             grouped_ids = [id(p) for group in parameter_groups for p in group["params"]]
             if len(grouped_ids) != len(set(grouped_ids)) or set(grouped_ids) != {id(p) for p in native.parameters()}:
                 raise ValueError("分层优化组存在遗漏或重复参数，拒绝开始训练")
-            LOGGER.info(f"早期融合分层AdamW：第1–10层lr={self.recipe.early_backbone_lr:g}，"
+            LOGGER.info(f"{'质量融合（含IR预训练分支）' if self.quality_fusion else '早期融合'}分层AdamW：骨干lr={self.recipe.early_backbone_lr:g}，"
                         f"RGB首层/颈部/双头lr={lr:g}，"
-                        f"IR/Depth首层lr={rates.get('auxiliary_stem', lr):g}，沿用原生偏置与归一化不衰减规则")
+                        f"新增辅助参数lr={rates.get(auxiliary_role, lr):g}，沿用原生偏置与归一化不衰减规则")
             return torch.optim.AdamW(parameter_groups, lr=lr, betas=(momentum, 0.999))
         native = unwrap_model(model)
         backbone_ids = {id(p) for module in native.model[:11] for p in module.parameters()}
@@ -1007,7 +1109,7 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def _setup_train(self) -> None:
         super()._setup_train()
-        start = 1 if self.early_fusion else self.epochs - self.args.close_mosaic + 1
+        start = 1 if self.early_fusion or self.quality_fusion else self.epochs - self.args.close_mosaic + 1
         self.stopper = PolishEarlyStopping(start, self.args.patience, self.recipe.min_delta, self.recipe.min_stop_epochs)
         files = ("main.py", "aic/__init__.py", "aic/model.py", "aic/training.py", "aic/data.py")
         # main.py允许只改RESUME_PATH和资源参数，配方本身另行比较；组件源码不可偷偷变化。
@@ -1028,6 +1130,15 @@ class FusionDetectionTrainer(DetectionTrainer):
                                    "recipe": asdict(self.recipe), "hyp": settings,
                                    "audit": self.audit, "sources": sources, "framework": framework,
                                    "parent_initialization": self.parent_initialization}
+        if self.quality_fusion:
+            self.training_signature["quality_preprocessing"] = {
+                "version": QUALITY_PREPROCESS_VERSION, "input_channels": 6,
+                "channel_order": ["R", "G", "B", "IR", "Depth", "Depth_support"],
+                "png_valid_mm": [DEPTH_MIN_MM, DEPTH_MAX_MM], "jpg_support": "gray_gt_zero_proxy",
+                "support_interpolation": "bilinear_fraction", "depth_interpolation": "support_weighted_bilinear",
+                "fusion_level": "P3_neck_input_only", "ir_window": 3,
+                "initialization": "official_rgb_ir_layers_0_to_4_depth_first_32_filters",
+            }
         if self.resume_metadata:
             if self.resume_metadata["signature"] != self.training_signature:
                 raise ValueError("断点的配方、数据审计或源码已改变，请新训而非混合恢复")
@@ -1043,10 +1154,11 @@ class FusionDetectionTrainer(DetectionTrainer):
             {**self.training_signature, "content_hw": [self.recipe.image_height, self.recipe.image_width],
              "tensor_hw": canvas_shape((self.recipe.image_height, self.recipe.image_width)),
              "validation_geometry": validation_geometry,
-             "validation_padding": [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
+             "validation_padding": [114, 114, 114, 0, 0, 0] if self.quality_fusion else [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
              "polish_start_epoch": 1 if self.recipe.training_stage == "polish" else self.epochs - self.args.close_mosaic + 1,
              "head_loss_weights": [0.8, 0.2], "validation_precision": "FP32",
              "initialization": self.parent_initialization["kind"] if self.parent_initialization else
+                               "official_rgb_pretrained_ir_supported_depth" if self.quality_fusion else
                                "official_rgb_plus_trainable_zero_ir_depth" if self.early_fusion else "rgb_plus_auxiliary_encoders",
              "checkpoint_selection": "mAP50-95",
              "class_aliases": {} if self.parent_initialization else {"sports ball": "ball"},
@@ -1061,7 +1173,7 @@ class FusionDetectionTrainer(DetectionTrainer):
             destination = code / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(PROJECT_ROOT / name, destination)
-        structure = "分模态首层v18" if self.recipe.split_stem else "五通道首层" if self.early_fusion else "三分支门控"
+        structure = "质量感知P3融合v19" if self.quality_fusion else "分模态首层v18" if self.recipe.split_stem else "五通道首层" if self.early_fusion else "三分支门控"
         geometry = (f"原生方形{self.args.imgsz}×{self.args.imgsz}，{structure}" if self.native_square
                     else f"内容1920×1080，张量1920×1088，{structure}")
         LOGGER.info(f"融合输入：{geometry}；物理批次{self.batch_size}，有效批次{self.args.nbs}")
@@ -1127,9 +1239,15 @@ class FusionDetectionTrainer(DetectionTrainer):
         native = unwrap_model(self.model)
         loss = native.criterion
         diagnostics = {"epoch": self.epoch + 1, "aux_grad_norm": float(self.last_aux_grad) if self.last_aux_grad is not None else None}
-        for branch in (() if self.early_fusion else ("ir", "depth")):
+        for branch in (() if self.early_fusion or self.quality_fusion else ("ir", "depth")):
             for level, block in zip((3, 4, 5), getattr(native, f"{branch}_fusion"), strict=True):
                 diagnostics[f"{branch}_p{level}_gate"] = float(block.last_gate_mean) if block.last_gate_mean is not None else None
+        if self.quality_fusion:
+            for key, value in (("ir_p3_gate", native.ir_fusion.last_gate_mean),
+                               ("ir_p3_center_weight", native.ir_fusion.last_center_weight),
+                               ("depth_p3_gate", native.depth_fusion.last_gate_mean),
+                               ("depth_support_mean", native.last_support_mean)):
+                diagnostics[key] = float(value) if value is not None else None
         for key in sorted(loss.running):
             diagnostics[key] = float(loss.running[key]) / max(loss.batches, 1)
         if self.early_fusion:

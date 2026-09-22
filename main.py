@@ -1,12 +1,13 @@
-"""以v14配方执行v18分模态首层学习率实验，按总体AP95判断收益。
+"""执行v19质量感知局部融合候选，按同划分总体AP95判断收益。
 
-RGB、红外、深度从首层共同学习；训练、验证和预测统一使用原生1280方形几何。
+RGB保留预训练主干；IR局部对应与带支持掩码的Depth只在P3颈部输入融合。
+训练、验证和预测统一使用1280方形几何及支持加权深度插值。
 保留v14的200轮日程及第101轮关闭Mosaic；关闭v17受限采样，清洗版1709/291不变。
 
 开始正式训练：
     uv run python main.py
-训练完成且选定v18后生成复赛预测TXT包：
-    uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_yolo26l_1280_v18_split_stem/weights/best.pt --source "数据集/复赛测试集" --imgsz 1280 --height 1280 --output predict_v18_round2
+训练完成且选定v19后生成复赛预测TXT包：
+    uv run python predict.py --weights runs/detect/AIC_RGBIRDepth_yolo26l_1280_v19_quality_fusion/weights/best.pt --source "数据集/复赛测试集" --imgsz 1280 --height 1280 --batch 2 --output predict_v19_round2
 中断恢复：
     将RESUME_PATH设为本配方尚未完成的weights/last.pt，再运行本文件。
     恢复另建目录；配方、源码、数据审计必须一致。
@@ -14,7 +15,7 @@ RGB、红外、深度从首层共同学习；训练、验证和预测统一使�
 用户已用v4提交复赛，分数未知；复赛测试集不用于训练、伪标签或调参。
 v14同协议基线AP95为0.3917876103；没有提升时仍保留v14，不把本地AP换算成赛事分数。
 先观察前20轮的AP95与分支诊断；不会因首轮未达0.4而停止，不保证达到0.60。
-本入口不自动探测显存；方案见docs/superpowers/plans/2026-09-21-v18-split-stem.md。
+本入口不自动探测显存；方案见docs/superpowers/plans/2026-09-22-v19-quality-fusion.md。
 """
 
 # 内置库
@@ -43,12 +44,12 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v18_split_stem"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v19_quality_fusion"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 恢复v14日程，预算由阶段筛选与patience控制，不搬回v4名义5000轮。
 MAX_EPOCHS: int = 200
-# 沿用v14历史最佳AP95门槛，不因首层新方案放宽预算，也不保证后期门槛可达。
+# 沿用v14历史最佳AP95门槛，不因新结构放宽预算，也不保证后期门槛可达。
 SCREENING_THRESHOLDS: tuple[tuple[int, float], ...] = (
     (10, 0.32),  # 节省明显弱配方预算，不要求首轮达到0.4
     (20, 0.34),  # 同划分v14已超过此值，不作为最终上限
@@ -68,35 +69,35 @@ RESUME_PATH: str | None = None
 if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent)
 
-    # 使用已有训练器，保留数据审计与恢复保护，仅拆分首层优化参数。
+    # 保留训练器与数据审计；新结构、新预处理共同版本化，不能恢复v18断点。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
-        architecture="early_v10",  # 恢复v4首层融合，不把模态置零伪装多模态
-        split_stem=True,  # RGB/IR/Depth卷积独立参数组，相加后共用原首层BN与激活
+        architecture="quality_v19",  # 单模型P3融合：RGB定位、IR局部对应、Depth质量残差
+        split_stem=False,  # 不再使用v18线性求和首层；RGB首层保持官方三通道
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
         min_stop_epochs=20,  # 保留v14最低耐心停止轮数；阶段筛选独立生效
         initial_weights_sha256=None,  # 无微调父权重，训练器仍记录实际初始化来源
         image_height=IMAGE_HW[1],  # 原生训练画布高度1280
         image_width=IMAGE_HW[0],  # 与下方imgsz一致
-        backbone_lr=0.0001,  # 历史门控专用；当前骨干由early_backbone_lr指定
-        auxiliary_lr=0.0005,  # v18新增IR/Depth首层真实AdamW学习率，5倍主学习率为待验证候选
-        early_backbone_lr=0.00002,  # 沿用v14有本地改善证据的主学习率0.2倍
+        backbone_lr=0.0001,  # 历史v9专用；v19预训练骨干由early_backbone_lr指定
+        auxiliary_lr=0.0001,  # 新融合/Depth分支按主学习率学习，不沿用失败的5倍辅助学习率
+        early_backbone_lr=0.00002,  # RGB第1–10层及复制的IR第0–4层使用0.2倍学习率
         val_batch=2,  # FP32验证与v14独立复评采用同样批次大小
         min_delta=0.0,  # 沿用v14，真实AP95新高即可重置耐心
         polish_scale=None,  # 第101轮只关Mosaic，保留v14的scale=0.3
         polish_translate=None,  # 关闭拼图后仍保留translate=0.1，与v14相同
         screening_thresholds=SCREENING_THRESHOLDS,  # 检查历史最佳AP95，结果写screening_history.csv
-        geometry="native_square",  # 复用v4原生LetterBox、Mosaic和透视增强链
+        geometry="native_square",  # 原生几何；v19仅替换深度插值及辅助/支持通道零补边
         data_audit=DATA_AUDIT,  # 使用最近一次已落位审计
         repeat_threshold=0.0,  # v17未改善总体AP95，关闭受限重复，回到v14基本采样
     ))
 
-    # 从官方模型迁移RGB；IR/Depth新增卷积零初始化后参与学习。
+    # 官方RGB迁移后复制IR浅层；Depth继承部分首层滤波器，其余新增层正常学习。
     model = YOLO(RESUME_PATH or MODEL_PATH)
 
     # 训练函数：保留原生YOLO进度条、损失和轮末验证输出。
     model.train(
         # 一、模型、数据与训练时长
-        trainer=trainer,  # 五通道原生增强、审计校验、分层学习率及单标签验证器
+        trainer=trainer,  # 三模态+派生支持通道、原生同步几何、审计与单标签验证
         model=RESUME_PATH or MODEL_PATH,  # 与上方YOLO实例使用相同基底或恢复权重
         mode="train",  # 显式记录运行模式，model.train也会固定此值
         data=DATA_PATH,  # 只读取datasets，不修改官方源文件
@@ -112,9 +113,9 @@ if __name__ == "__main__":
         save_dir=None,  # 由project/name生成独立目录，不硬编码覆盖路径
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
-        imgsz=IMAGE_HW[0],  # 恢复v4的1280方形训练尺度
-        batch=4,  # v4已在本机验证该分辨率与物理批次可运行
-        nbs=16,  # 稳态有效批次16，batch=4时累积4批，预热沿用原生策略
+        imgsz=IMAGE_HW[0],  # 保留1280，避免同时更改分辨率影响结构比较
+        batch=2,  # 新增IR浅层分支的未实测起点，不能沿用旧模型batch4显存结论
+        nbs=16,  # 稳态有效批次16，batch2时累积8批，预热沿用原生策略
         workers=4,  # 每进程预取1批，关闭锁页，降低CPU内存峰值
         device=0,  # 本机RTX 5080，不调整其他进程资源
         amp="bf16",  # 训练BF16；轮末验证与预测统一FP32
@@ -127,7 +128,7 @@ if __name__ == "__main__":
 
         # 三、优化器、学习率与收敛
         optimizer="AdamW",  # 沿用v4优化器，不用auto切换
-        lr0=0.0001,  # RGB首层/颈部/双头；骨干2e-5，IR/Depth首层5e-4
+        lr0=0.0001,  # RGB首层/颈部/双头及新增模块；RGB骨干与IR复制层2e-5
         lrf=0.01,  # 恢复v14的200轮余弦末端为初始学习率1%
         cos_lr=True,  # 不继续v16的60轮快速衰减组合
         momentum=0.9,  # AdamW第一动量系数
@@ -135,12 +136,12 @@ if __name__ == "__main__":
         warmup_epochs=5.0,  # 官方基底重迁移，沿用v14的5轮预热
         warmup_momentum=0.8,  # 保留框架兼容配置，AdamW不使用SGD动量组
         warmup_bias_lr=0.0,  # 偏置不以高学习率跳启
-        freeze=None,  # 五通道首层与预训练主干全部可训练
+        freeze=None,  # RGB、IR、Depth和门控均可训练，不冻结或伪装缺失模态
 
         # 四、同步增强与关闭拼图阶段
-        mosaic=0.5,  # 沿用v4/v14，不与新首层学习率同时更换增强配方
+        mosaic=0.5,  # 沿用v14概率；拼图空白的辅助与支持通道填0
         close_mosaic=100,  # 最后100轮关闭，即第101轮起不拼图，与v4/v14时间点一致
-        scale=0.3,  # 沿用v14，不在拆分首层时同时调整增强幅度
+        scale=0.3,  # 沿用v14幅度；深度与支持按同一随机矩阵处理
         translate=0.1,  # 沿用v14平移幅度，关闭拼图后保持不变
         fliplr=0.5,  # 训练和收尾均保留同步水平翻转
         flipud=0.0,  # 城市场景不做上下翻转
@@ -150,7 +151,7 @@ if __name__ == "__main__":
         degrees=0.0,  # 不增加旋转
         shear=0.0,  # 不增加剪切形变
         perspective=0.0,  # 不增加透视形变
-        bgr=0.0,  # 保持RGB3+IR1+Depth1通道顺序
+        bgr=0.0,  # 保持RGB3+IR1+Depth1+Support1顺序，支持不是第四种传感器
         mixup=0.0,  # 不叠加样本混合
         cutmix=0.0,  # 不叠加额外裁剪粘贴
         copy_paste=0.0,  # 不复制粘贴目标，本轮也关闭受限采样
@@ -182,7 +183,7 @@ if __name__ == "__main__":
         max_det=100,  # 赛事单图最多100框
         patience=40,  # 沿用v14耐心，无新高不因200轮上限强行跑满
         save=True,  # 保留best、best_map50及last
-        save_period=5,  # 保留中段检查点与首层诊断，仍逐轮保存last
+        save_period=5,  # 保留中段检查点，复用正式前向记录局部门控与支持诊断
         plots=True,  # 保留原生曲线、混淆矩阵和样本可视化
         save_conf=False,  # 不额外写原生预测TXT，赛事文件由predict.py生成
         save_crop=False,  # 不保存裁剪目标，避免产生冗余磁盘占用
