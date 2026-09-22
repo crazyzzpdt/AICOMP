@@ -65,7 +65,7 @@ from src.yolo.aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSIO
 # 相对路径以入口文件所在目录为基准，兼容 IDE 从其他位置启动。
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 # 保留用户已有权重选择；更换提交模型请显式传--weights，不自动选最新运行。
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v5_full/weights/best.pt"
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26l_1280_v4_clean_lr1e4/weights/best.pt"
 # 官方复赛的同名visible、infrared、depth；不得用于训练或伪标签。
 SOURCE_PATH: Path = PROJECT_ROOT / "datasets/test"
 # 与训练产物隔离；再次预测时修改这里或传 --output，不清空已有结果。

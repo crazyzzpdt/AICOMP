@@ -1,7 +1,7 @@
-"""执行v20 RGB诊断训练，先判断辅助模态是否值得继续投入。
+"""执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
 保留v14的1280输入、初始化顺序、增强、骨干学习率和清洗版1709/291。
-沿用五通道增强后仅将RGB送入真正三通道网络，不伪装成三模态提交模型。
+五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，第20轮验证和保存后因预算停止，不改成20轮快速衰减。
 
 由用户启动诊断训练：
@@ -35,7 +35,7 @@ from ultralytics import YOLO
 from src.yolo.aic.training import FusionDetectionTrainer, FusionRecipe
 
 
-# 与v14相同的官方RGB基底重新迁移，不续训v15或旧划分v4。
+# 使用官方RGB预训练权重迁移到五通道首层，不续训历史赛事权重。
 MODEL_PATH: str = "./orgin_models/yolo26l.pt"
 # 沿用已审计的官方新版标签与1709/291划分，不重新生成图像副本。
 DATA_PATH: str = "./datasets/data.yaml"
@@ -43,7 +43,7 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGB_yolo26l_1280_v20_diagnostic"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_early_fusion_v21"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 保留v14学习率日程，不能把此值改成20来代替预算停止。
@@ -58,9 +58,9 @@ RESUME_PATH: str | None = None
 if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent)
 
-    # 保留训练器与数据审计；诊断版本独立，不能恢复旧三模态断点。
+    # 保留训练器与数据审计；新五通道配方独立，不能恢复旧断点。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
-        architecture="rgb_v20",  # 仅RGB进入网络，用于定位问题来源，非三模态提交候选
+        architecture="early_v10",  # RGB3+IR1+Depth1五通道共享骨干，作为正式三模态候选
         split_stem=False,  # 不引入v18拆分首层或v19分支
         budget_epochs=BUDGET_EPOCHS,  # 第20轮验证与保存后停止，学习率仍按200轮衰减
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
@@ -76,18 +76,18 @@ if __name__ == "__main__":
         polish_scale=None,  # 第101轮只关Mosaic，保留v14的scale=0.3
         polish_translate=None,  # 关闭拼图后仍保留translate=0.1，与v14相同
         screening_thresholds=(),  # 本轮仅预算停止，记录budget_history.csv，不按AP硬门槛中断
-        geometry="native_square",  # 完整沿用v14缩放、增强与114补边，最后选取RGB
+        geometry="native_square",  # 五模态通道同步缩放、增强与114补边
         data_audit=DATA_AUDIT,  # 使用最近一次已落位审计
         repeat_threshold=0.0,  # v17未改善总体AP95，关闭受限重复，回到v14基本采样
     ))
 
-    # 官方RGB与类别语义迁移；不加载历史赛事权重，也不新增辅助编码器。
+    # 官方RGB权重与类别语义迁移；不加载历史赛事权重或新增辅助编码器。
     model = YOLO(RESUME_PATH or MODEL_PATH)
 
     # 训练函数：保留原生YOLO进度条、损失和轮末验证输出。
     model.train(
         # 一、模型、数据与训练时长
-        trainer=trainer,  # 保留审计与原生几何，网络仅接收RGB，验证协议不变
+        trainer=trainer,  # 保留审计与原生几何，网络接收五通道，验证协议不变
         model=RESUME_PATH or MODEL_PATH,  # 与上方YOLO实例使用相同基底或恢复权重
         mode="train",  # 显式记录运行模式，model.train也会固定此值
         data=DATA_PATH,  # 只读取datasets，不修改官方源文件
@@ -126,10 +126,10 @@ if __name__ == "__main__":
         warmup_epochs=5.0,  # 官方基底重迁移，沿用v14的5轮预热
         warmup_momentum=0.8,  # 保留框架兼容配置，AdamW不使用SGD动量组
         warmup_bias_lr=0.0,  # 偏置不以高学习率跳启
-        freeze=None,  # 全部RGB模型参数可训练，不额外冻结骨干
+        freeze=None,  # 全部五通道模型参数可训练，不额外冻结骨干
 
         # 四、同步增强与关闭拼图阶段
-        mosaic=0.5,  # 沿用v14概率与五通道114补边，增强后仅选RGB
+        mosaic=0.5,  # 沿用v14概率与五通道114补边，三模态同步增强
         close_mosaic=100,  # 日程中第101轮关闭，本轮20轮预算不会进入收尾
         scale=0.3,  # 沿用v14同步几何幅度
         translate=0.1,  # 沿用v14平移幅度，关闭拼图后保持不变
