@@ -23,7 +23,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from collections import Counter, deque
@@ -55,6 +54,9 @@ from ultralytics.models.yolo.detect.predict import DetectionPredictor
 from ultralytics.utils import nms, ops
 
 # 自己的模块
+from src.modalities import FLOAT_PREPROCESS_VERSION, configure_fp32, read_float_modalities, letterbox_float
+from src.dfine_runtime import (check_source as check_dfine_runtime_source, build_model as build_dfine_runtime_model,
+                               decode_predictions as decode_dfine_runtime_predictions)
 from src.yolo.aic.data import CLASS_NAMES, IMAGE_SUFFIXES, QUALITY_PREPROCESS_VERSION, fuse_modalities, fuse_quality_modalities
 from src.yolo.aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
                        EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, QualityFusionDetectionModel,
@@ -164,8 +166,11 @@ class FusionPredictor:
                 recipe.get("architecture") != "quality_v19" or self.geometry != "native_square" or
                 signature.get("evaluation_protocol") != EVALUATION_PROTOCOL):
             raise ValueError("v19检查点的六通道支持掩码/几何/验证协议不一致，拒绝套用旧预测路径")
-        self.input_geometry = "quality_native" if quality else self.geometry
-        self.padding_values = [114, 114, 114, 0, 0, 0] if quality else [114] * 5 if self.geometry == "native_square" else [114, 114, 114, 0, 0]
+        self.continuous_depth = getattr(model, "preprocess_version", None) == FLOAT_PREPROCESS_VERSION
+        if bool(recipe.get("continuous_depth", False)) != self.continuous_depth:
+            raise ValueError("浮点输入协议与训练签名不一致")
+        self.input_geometry = "float_native" if self.continuous_depth else "quality_native" if quality else self.geometry
+        self.padding_values = [114, 114, 114, 0, 0] if self.continuous_depth else [114, 114, 114, 0, 0, 0] if quality else [114] * 5 if self.geometry == "native_square" else [114, 114, 114, 0, 0]
 
     @torch.inference_mode()
     def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
@@ -184,57 +189,13 @@ class FusionPredictor:
 
 
 def check_dfine_source() -> Path:
-    """检查已下载的固定版本官方源码；缺失时报告准备命令而不联网。"""
-    source = PROJECT_ROOT / "src" / "D-FINE"
-    if not (source / "src/core/yaml_config.py").is_file():
-        source = PROJECT_ROOT / "vendor" / "D-FINE"
-    if not (source / "src/core/yaml_config.py").is_file():
-        raise FileNotFoundError("缺少 vendor/D-FINE，请先按 docs/归档/01_早期训练与清洗.md 的D-FINE章节准备官方源码")
-    # 仓库内的D-FINE源码是随项目提交的目录副本，不一定带独立.git；避免误读项目根提交。
-    git_dir = source / ".git"
-    if git_dir.exists():
-        revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
-                                  check=True, capture_output=True, text=True).stdout.strip()
-        dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"],
-                               check=True, capture_output=True, text=True).stdout.strip()
-        if revision != DFINE_COMMIT or dirty:
-            raise ValueError(f"官方源码版本不符或被修改：{revision}；请使用文档指定的未修改版本")
-    if str(source) not in sys.path:
-        sys.path.insert(0, str(source))
-    return source
+    """训练和预测共用固定源码快照校验，不借用根仓库Git身份。"""
+    return check_dfine_runtime_source()
 
 
 def build_dfine_model(imgsz: int) -> nn.Module:
-    """构建不联网的 12 类五通道 D-FINE-L，输入端不冻结。
-
-    Args:
-        imgsz: 正方形填充尺寸，必须为 32 的倍数。
-
-    Returns:
-        与历史检查点结构一致的五通道模型。
-    """
-    source = check_dfine_source()
-    # 项目自身也有src包；扩展同一包的搜索路径，使D-FINE内部的src.core保持原始导入语义。
-    import src as project_src
-    dfine_src = str(source / "src")
-    if dfine_src not in project_src.__path__:
-        project_src.__path__.append(dfine_src)
-    from src.core import YAMLConfig
-    # 导入D-FINE注册模块，填充YAML构建器所需的全局组件表。
-    import src.nn  # noqa: F401
-    import src.zoo.dfine  # noqa: F401
-
-    config = YAMLConfig(
-        str(source / "configs/dfine/include/dfine_hgnetv2.yml"),
-        num_classes=len(CLASS_NAMES), remap_mscoco_category=False,
-        eval_spatial_size=[imgsz, imgsz], num_top_queries=100,
-        HGNetv2={"name": "B4", "pretrained": False, "freeze_at": -1, "freeze_norm": True},
-    )
-    model = config.model
-    original = model.backbone.stem.stem1.conv
-    expanded = nn.Conv2d(5, original.out_channels, original.kernel_size, original.stride,
-                         original.padding, bias=original.bias is not None)
-    model.backbone.stem.stem1.conv = expanded
+    """构建与训练同源的12类五通道D-FINE-L。"""
+    model, _ = build_dfine_runtime_model(imgsz)
     return model
 
 
@@ -278,24 +239,9 @@ def resize_dfine_fused(image: np.ndarray, imgsz: int, scale: float = 1.0) -> tup
 
 
 def decode_dfine_predictions(outputs: dict[str, torch.Tensor], targets: list[dict[str, torch.Tensor]], imgsz: int,
-                       conf: float, max_det: int) -> list[dict[str, torch.Tensor]]:
-    """保留 D-FINE 原生查询类别排序，反算填充和缩放；不使用 NMS 或集成。"""
-    probabilities = outputs["pred_logits"].float().sigmoid()
-    # 与官方后处理一致，从查询×类别联合分数选择候选；不是 YOLO 的多标签 NMS。
-    scores, positions = probabilities.flatten(1).topk(min(300, probabilities.shape[1] * len(CLASS_NAMES)), dim=1)
-    categories = positions % len(CLASS_NAMES)
-    queries = positions // len(CLASS_NAMES)
-    all_boxes = box_convert(outputs["pred_boxes"].float(), "cxcywh", "xyxy") * imgsz
-    all_boxes = all_boxes.gather(1, queries.unsqueeze(-1).expand(-1, -1, 4))
-    results: list[dict[str, torch.Tensor]] = []
-    for boxes, confidence, labels, target in zip(all_boxes, scores, categories, targets):
-        sx, sy, left, top = [float(v) for v in target["geometry"]]
-        width, height = [int(v) for v in target["orig_size"]]
-        boxes[:, [0, 2]] = ((boxes[:, [0, 2]] - left) / sx).clamp(0, width)
-        boxes[:, [1, 3]] = ((boxes[:, [1, 3]] - top) / sy).clamp(0, height)
-        valid = (confidence >= conf) & torch.isfinite(boxes).all(1) & (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-        results.append({"boxes": boxes[valid][:max_det], "scores": confidence[valid][:max_det], "labels": labels[valid][:max_det]})
-    return results
+                             conf: float, max_det: int) -> list[dict[str, torch.Tensor]]:
+    """复用训练轮末验证的查询排序及坐标恢复。"""
+    return decode_dfine_runtime_predictions(outputs, targets, imgsz, conf, max_det)
 
 
 class DFinePredictor:
@@ -308,10 +254,13 @@ class DFinePredictor:
         checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
         if checkpoint.get("format") != DFINE_CHECKPOINT_FORMAT or checkpoint.get("dfine_commit") != DFINE_COMMIT:
             raise ValueError("不是本项目固定版本的 D-FINE 五通道权重")
-        if checkpoint.get("preprocess") != DFINE_PREPROCESS_VERSION or list(checkpoint["classes"]) != list(CLASS_NAMES):
+        if checkpoint.get("preprocess") not in {DFINE_PREPROCESS_VERSION, FLOAT_PREPROCESS_VERSION} or list(checkpoint["classes"]) != list(CLASS_NAMES):
             raise ValueError("权重的预处理或类别顺序与当前预测代码不符")
         if checkpoint["config"]["imgsz"] != imgsz:
             raise ValueError("首版 D-FINE 预测必须与训练 imgsz 一致，避免隐式更改位置编码与锚点")
+        self.preprocess = checkpoint["preprocess"]
+        self.continuous_depth = self.preprocess == FLOAT_PREPROCESS_VERSION
+        self.input_geometry = "float_dfine" if self.continuous_depth else "fixed_rect"
         self.model = build_dfine_model(imgsz)
         self.model.load_state_dict(checkpoint["ema"]["module"], strict=True)
         self.model.to(self.device).eval()
@@ -324,7 +273,7 @@ class DFinePredictor:
         """整批传入 GPU，以 FP32 前向并分别还原原图坐标。
 
         Args:
-            images: 已等比填充的 CPU uint8 NCHW 五通道批次，可使用锁页内存。
+            images: CPU NCHW五通道；新协议float32，历史协议uint8，可使用锁页内存。
             targets: 每张原图的尺寸与缩放、填充信息，顺序必须与批次一致。
             conf: 提交候选的最低置信度。
             max_det: 每图保留的候选框上限。
@@ -332,11 +281,12 @@ class DFinePredictor:
         Returns:
             与输入顺序一致的原图像素坐标、置信度和类别。
         """
-        if images.dtype != torch.uint8 or images.ndim != 4 or tuple(images.shape[1:]) != (5, self.imgsz, self.imgsz):
-            raise ValueError("D-FINE 批次必须是 uint8 的 [N, 5, imgsz, imgsz]")
+        expected_dtype = torch.float32 if self.continuous_depth else torch.uint8
+        if images.dtype != expected_dtype or images.ndim != 4 or tuple(images.shape[1:]) != (5, self.imgsz, self.imgsz):
+            raise ValueError(f"D-FINE批次要求{expected_dtype}的[N,5,imgsz,imgsz]")
         if not len(images) or len(images) != len(targets):
             raise ValueError("D-FINE 批次不能为空，且图像与坐标信息数量必须一致")
-        # 先传 uint8 再转 FP32，传输字节数为 CPU 浮点输入的四分之一。
+        # 两套协议均只除255一次；新协议在读图/几何阶段已保留连续浮点。
         inputs = images.to(self.device, non_blocking=images.is_pinned()).float().div_(255)
         outputs = self.model(inputs)
         return decode_dfine_predictions(outputs, targets, self.imgsz, conf, max_det)
@@ -526,23 +476,28 @@ def load_prediction_sample(paths: tuple[Path, Path, Path], backend: str, imgsz: 
                            fusion_geometry: str = "fixed_rect") -> PredictionSample:
     """在读取线程中融合模态，并完成相应后端的同步缩放与填充。"""
     quality = backend == "fusion" and fusion_geometry == "quality_native"
-    fused = fuse_quality_modalities(*paths) if quality else fuse_modalities(*paths)
+    floating = fusion_geometry in {"float_native", "float_dfine"}
+    fused = read_float_modalities(*paths)[0] if floating else fuse_quality_modalities(*paths) if quality else fuse_modalities(*paths)
     channels = 6 if quality else 5
-    if fused.dtype != np.uint8 or fused.ndim != 3 or fused.shape[2] != channels:
-        raise ValueError(f"预测输入必须是 uint8 {channels}通道图：{paths[0].name}")
+    expected_dtype = np.float32 if floating else np.uint8
+    if fused.dtype != expected_dtype or fused.ndim != 3 or fused.shape[2] != channels:
+        raise ValueError(f"预测输入不符合{expected_dtype}/{channels}通道：{paths[0].name}")
     if backend == "yolo":
         return PredictionSample(paths[0], fused, None, {})
-    if backend == "fusion":
+    if floating:
+        canvas, geometry = letterbox_float(fused, imgsz, native=fusion_geometry == "float_native")
+    elif backend == "fusion":
         canvas, geometry = (letterbox_native_quality(fused, imgsz) if quality else
                             letterbox_native_fused(fused, imgsz) if fusion_geometry == "native_square"
                             else letterbox_fused(fused, (height, imgsz)))
     else:
         canvas, geometry = resize_dfine_fused(fused, imgsz)
     original_height, width = fused.shape[:2]
-    visible = np.ascontiguousarray(fused[:, :, :3][:, :, ::-1])
+    # 仅绘图副本转8位，模型输入canvas保持原协议精度。
+    visible = np.ascontiguousarray(fused[:, :, :3][:, :, ::-1]).astype(np.uint8)
     target = {"orig_size": torch.tensor([width, original_height]),
               "geometry": torch.tensor(geometry, dtype=torch.float64 if backend == "fusion" else torch.float32)}
-    # 预取阶段只保留 uint8；归一化移到 GPU，减少 CPU 拷贝与传输体积。
+    # 新协议CPU预取也是FP32；旧协议仍保留uint8读取兼容。
     return PredictionSample(paths[0], np.ascontiguousarray(canvas.transpose(2, 0, 1)), visible, target)
 
 
@@ -737,6 +692,8 @@ def build_submission(output: Path, image_names: list[str]) -> Path:
 def prediction_source_hashes() -> dict[str, str]:
     """记录本次预测源码摘要，补材料时拒绝用后来修改的代码冒充原运行。"""
     paths = [("predict1.py", Path(__file__))]
+    paths.extend((name, PROJECT_ROOT / name) for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine_runtime.py",
+                                                        "src/D-FINE/source_manifest.json"))
     paths.extend((path.relative_to(PROJECT_ROOT).as_posix(), path)
                  for path in sorted((PROJECT_ROOT / "src" / "yolo" / "aic").glob("*.py")))
     paths.extend((f"tools/{name}", PROJECT_ROOT / "tools" / name)
@@ -803,6 +760,8 @@ def export_round2_materials(config: PredictionConfig, metadata: dict[str, object
     copy_file(archive, root / "submission.zip")
     copy_file(config.output / "prediction.json", root / "prediction.json")
     copy_file(Path(__file__), code / "predict1.py")
+    for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine_runtime.py"):
+        copy_file(PROJECT_ROOT / name, code / name)
     copy_sources(PROJECT_ROOT / "src" / "yolo" / "aic", code / "src" / "yolo" / "aic")
     copy_sources(PROJECT_ROOT / "docs", code / "docs")
     for name in ("pyproject.toml", "uv.lock"):
@@ -814,8 +773,7 @@ def export_round2_materials(config: PredictionConfig, metadata: dict[str, object
     # 当前安装包含项目所需YOLO接口，不能仅写一个pip版本号就声称源码一致。
     copy_sources(Path(ultralytics.__file__).parent, code / "ultralytics")
     if metadata["backend"] == "dfine":
-        copy_sources(check_dfine_source(), code / "vendor" / "D-FINE")
-        pending.append("D-FINE源码包不含Git元数据；复现前按固定提交准备仓库以满足现有版本校验")
+        copy_sources(check_dfine_source(), code / "src" / "D-FINE")
     run = config.weights.parent.parent
     snapshot = run / "code"
     archived_run = PROJECT_ROOT / "src" / "tools" / "run_snapshots" / run.relative_to(PROJECT_ROOT / "runs")
@@ -958,6 +916,16 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
             if report.suffix.lower() != ".pdf" or handle.read(5) != b"%PDF-":
                 raise ValueError("技术方案须为真实PDF文件，不把Markdown改后缀当作PDF")
         config = replace(config, technical_report=report)
+    # 必须在CLI覆盖之后读取实际权重；0仅为D-FINE自动尺寸的明确哨兵。
+    if config.imgsz == 0 and (config.backend == "dfine" or
+                             config.backend == "auto" and config.weights.suffix.lower() == ".pth"):
+        weight_path = (PROJECT_ROOT / config.weights).resolve(strict=True)
+        checkpoint = torch.load(weight_path, map_location="cpu", weights_only=False)
+        size = checkpoint.get("config", {}).get("imgsz") if isinstance(checkpoint, dict) else None
+        if type(size) is not int or size <= 0 or size % 32:
+            raise ValueError("D-FINE权重缺少合法训练imgsz，不回退猜测尺寸")
+        config = replace(config, imgsz=size, height=size)
+        del checkpoint
     if config.imgsz <= 0 or config.imgsz % 32:
         raise ValueError("imgsz 必须为 32 的正整数倍")
     if min(config.batch, config.workers, config.save_workers, config.prefetch_batches, config.expected_count, config.log_every) <= 0:
@@ -996,6 +964,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                 raise ValueError("排行榜结果包已改变或缺少摘要，拒绝与其他模型材料混用")
         export_round2_materials(replace(config, weights=weights, source=source, output=output), metadata, archive)
         return
+    configure_fp32()
     backend = ("dfine" if weights.suffix.lower() == ".pth" else "yolo") if config.backend == "auto" else config.backend
     config = replace(config, weights=weights, source=source, output=output, backend=backend)
     source_hashes = prediction_source_hashes()
@@ -1083,7 +1052,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
     if backend == "dfine":
         metadata.update({"dfine_commit": DFINE_COMMIT, "epoch": model.epoch, "nms": False,
                          "iou": None, "multi_label": None, "rect": False,
-                         "postprocess": "native_query_class_topk", "preprocess": "square_letterbox_rgbirdepth_div255",
+                         "postprocess": "native_query_class_topk", "preprocess": model.preprocess,
                          "weights_kind": "ema"})
     elif backend == "fusion":
         metadata.update({"fusion_version": model.version, "architecture": model.architecture, "content_hw": list(model.content_hw),
@@ -1093,7 +1062,7 @@ def predict(config: PredictionConfig, argv: list[str] | None = None) -> None:
                          "yolo_profile": None, "postprocess": "shared_single_label_nms",
                          "rect": False, "validation_geometry": model.geometry,
                          "padding_values": model.padding_values,
-                         "preprocess": QUALITY_PREPROCESS_VERSION if model.architecture == "quality_v19" else
+                         "preprocess": FLOAT_PREPROCESS_VERSION if model.continuous_depth else QUALITY_PREPROCESS_VERSION if model.architecture == "quality_v19" else
                                        "native_square_ceil_pad114_div255_v1" if model.geometry == "native_square" else "fixed_rectangle_rgbirdepth_div255",
                          "quality_preprocessing": model.quality_preprocessing,
                          "effective_model_batch": config.batch,

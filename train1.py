@@ -1,20 +1,18 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-v24以v21为对照，保留1280输入、初始化顺序、增强和清洗版1709/291，各组学习率减半。
+v25采用连续FP32深度和温和传感器增强，保留1280及清洗版1709/291。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
 
 由用户启动训练：
     uv run python train1.py
 本轮不生成赛事提交包，predict1.py负责YOLO预测。
-中断恢复：
-    将RESUME_PATH设为本配方尚未完成的weights/last.pt，再运行本文件。
-    恢复另建目录；配方、源码、数据审计必须一致。
+新输入协议不恢复历史训练；旧权重仅由预测入口保留兼容。
 
-用户已用v4提交复赛，分数未知；复赛测试集不用于训练、伪标签或调参。
+复赛已知v6得49.815；复赛测试集不用于训练、伪标签或修改标签。
 v14同协议基线AP95为0.3917876103；没有提升时仍保留v14，不把本地AP换算成赛事分数。
 比较前20轮的AP95、AP75及逐类定位，不用首轮0.4门槛判断最终上限。
-本入口不自动探测显存；方案见docs/v19复盘与v20模态诊断.md。
+本入口不自动探测显存；当前方案见docs/浮点三模态实施方案.md。
 """
 
 # 内置库
@@ -33,6 +31,7 @@ from ultralytics import YOLO
 
 # 自己的模块
 from src.yolo.aic.training import FusionDetectionTrainer, FusionRecipe
+from src.modalities import SensorAugment, configure_fp32
 
 
 # 使用官方RGB预训练权重迁移到五通道首层，不续训历史赛事权重。
@@ -43,24 +42,27 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v24_lower_lr"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v25_float"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 保留v14学习率日程，不能把此值改成20来代替预算停止。
 MAX_EPOCHS: int = 200
 # 五通道模型需覆盖v4约100轮的收敛区间，最多运行200轮。
 BUDGET_EPOCHS: int = 200
-# 首训保持None，仅恢复相同配方中断状态，已完成模型拒绝恢复。
+# 新浮点协议只从官方基底开始，不接入旧训练状态。
 RESUME_PATH: str | None = None
 
 
 # Windows DataLoader子进程会重新导入脚本，正式训练必须放在入口保护内。
 if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent)
+    configure_fp32()
 
     # 保留训练器与数据审计；新五通道配方独立，不能恢复旧断点。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
         architecture="early_v10",  # RGB3+IR1+Depth1五通道共享骨干，作为正式三模态候选
+        continuous_depth=True,  # 原始16位深度直接转FP32，不经过8位取整
+        sensors=SensorAugment(),  # 温和IR增益/噪声与深度有效区扰动，仅训练时启用
         split_stem=False,  # 不引入v18拆分首层或v19分支
         budget_epochs=BUDGET_EPOCHS,  # 允许完整200轮日程，避免把第20轮误判为最终上限
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
@@ -104,11 +106,11 @@ if __name__ == "__main__":
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
         imgsz=IMAGE_HW[0],  # 保留1280，避免同时更改分辨率影响结构比较
-        batch=4,  # 匹配v14物理批次，避免将BN批大小变化混入模态对照
-        nbs=16,  # 稳态累积4批，预热沿用v14原生策略
+        batch=2,  # 全FP32峰值显存尚未实测；用户可调整，不自动探测
+        nbs=16,  # 物理批次2时稳态累积8批；BN批次变化仍影响与v24的比较
         workers=4,  # 每进程预取1批，关闭锁页，降低CPU内存峰值
         device=0,  # 本机RTX 5080，不调整其他进程资源
-        amp="bf16",  # 训练BF16；轮末验证与预测统一FP32
+        amp=False,  # 前向/损失/验证FP32；入口同时关闭TF32
         cache=False,  # 不新增大体积融合NPY缓存
         rect=False,  # 原生方形画布，不使用按批次宽高比分组
         multi_scale=0.0,  # 不额外改变整批尺寸，保留scale几何增强
@@ -129,7 +131,7 @@ if __name__ == "__main__":
         freeze=None,  # 全部五通道模型参数可训练，不额外冻结骨干
 
         # 四、同步增强与关闭拼图阶段
-        mosaic=0.5,  # 沿用v14概率与五通道114补边，三模态同步增强
+        mosaic=0.5,  # 浮点画布：RGB填114、IR/Depth填0，三模态同步几何
         close_mosaic=100,  # 最后100轮关闭：200轮日程第101轮起收尾，与v21计划一致
         scale=0.3,  # 沿用v14同步几何幅度
         translate=0.1,  # 沿用v14平移幅度，关闭拼图后保持不变

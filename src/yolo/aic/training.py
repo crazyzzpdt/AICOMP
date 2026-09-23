@@ -9,6 +9,7 @@ from __future__ import annotations
 # 内置库
 import csv
 import hashlib
+import io
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from collections.abc import Iterator
 from contextlib import redirect_stdout, redirect_stderr
 from copy import copy, deepcopy
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
@@ -48,6 +50,8 @@ from .model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, S
 from .data import (CLASS_NAMES, IMAGE_SUFFIXES, QUALITY_PREPROCESS_VERSION, DEPTH_MIN_MM, DEPTH_MAX_MM,
                    file_hash, fuse_modalities, fuse_quality_modalities, resize_quality_image,
                    transform_quality_image, verify_source_images)
+from src.modalities import (FLOAT_PREPROCESS_VERSION, SensorAugment, augment_sensors, configure_fp32,
+                            read_float_modalities, resize_float_image, transform_float_image, float_canvas)
 
 
 # 历史主训练默认至少二十轮；显式短收尾可单独设置，最佳权重始终按真实AP95保存。
@@ -225,6 +229,99 @@ class RGBDiagnosticDataset(MultimodalYOLODataset):
         return sample
 
 
+class FloatLetterBox(LetterBox):
+    """保留原生标签更新，只替换连续浮点图像的缩放及填充。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+        image = resize_float_image(labels["img"], tuple(params["new_unpad"]))
+        height, width = image.shape[:2]
+        top, left = params["top"], params["left"]
+        canvas = float_canvas(height + top + params["bottom"], width + left + params["right"])
+        canvas[top:top + height, left:left + width] = image
+        labels["img"], labels["resized_shape"] = canvas, params["new_shape"]
+        return labels
+
+
+class FloatMosaic(Mosaic):
+    """四图布局和标签计算不变，避免原生uint8画布量化深度。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params is None or self.n != 4:
+            raise ValueError("浮点协议只支持四图Mosaic")
+        canvas = float_canvas(self.imgsz * 2, self.imgsz * 2)
+        for item in params["layout"]:
+            image = item["labels_patch"]["img"]
+            canvas[item["y1a"]:item["y2a"], item["x1a"]:item["x2a"]] = image[item["y1b"]:item["y2b"], item["x1b"]:item["x2b"]]
+        labels["img"] = canvas
+        return labels
+
+
+class FloatPerspective(RandomPerspective):
+    """沿用原生矩阵和框过滤，图像全程连续浮点。"""
+
+    def apply_image(self, labels: dict[str, Any], params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if params is None:
+            raise ValueError("缺少几何矩阵")
+        matrix, size = params["M"], params["size"]
+        operation = (lambda plane, border, mode: cv2.warpPerspective(plane, matrix, size, flags=mode, borderValue=border)) if self.perspective else (
+            lambda plane, border, mode: cv2.warpAffine(plane, matrix[:2], size, flags=mode, borderValue=border))
+        labels["img"] = transform_float_image(labels["img"], operation)
+        labels["resized_shape"] = labels["img"].shape[:2]
+        return labels
+
+
+class FloatYOLODataset(MultimodalYOLODataset):
+    """新训练的连续浮点协议，不读取旧融合缓存。"""
+
+    def __init__(self, *args: Any, sensors: SensorAugment, **kwargs: Any) -> None:
+        self.sensors = sensors
+        self.metric_depth: dict[int, bool] = {}
+        super().__init__(*args, **kwargs)
+
+    def load_fused_image(self, index: int) -> np.ndarray:
+        path = Path(self.im_files[index])
+        image, metric = read_float_modalities(path, self.infrared_dir / path.name, self.depth_dir / path.name)
+        self.metric_depth[index] = metric
+        return image
+
+    def resize_image(self, image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
+        return resize_float_image(image, size_wh)
+
+    def resize_native_image(self, image: np.ndarray) -> np.ndarray:
+        h, w = image.shape[:2]
+        ratio = self.imgsz / max(h, w)
+        return resize_float_image(image, (min(math.ceil(w * ratio), self.imgsz), min(math.ceil(h * ratio), self.imgsz)))
+
+    def get_image_and_label(self, index: int) -> dict[str, Any]:
+        sample = super().get_image_and_label(index)
+        if self.augment:
+            # 缓存保留干净浮点图；每次取样重新增强，不原地累积噪声。
+            sample["img"] = augment_sensors(sample["img"], self.metric_depth[index], self.sensors)
+        return sample
+
+    def build_transforms(self, hyp: Any = None) -> Compose:
+        transforms = super().build_transforms(hyp)
+
+        def replace_geometry(composition: Compose) -> None:
+            for index, transform in enumerate(composition.transforms):
+                if isinstance(transform, Compose):
+                    replace_geometry(transform)
+                elif isinstance(transform, Mosaic):
+                    composition.transforms[index] = FloatMosaic(self, imgsz=self.imgsz, p=hyp.mosaic, n=4)
+                elif isinstance(transform, RandomPerspective):
+                    composition.transforms[index] = FloatPerspective(
+                        degrees=hyp.degrees, translate=hyp.translate, scale=hyp.scale,
+                        shear=hyp.shear, perspective=hyp.perspective, size=(self.imgsz, self.imgsz))
+                elif isinstance(transform, LetterBox):
+                    composition.transforms[index] = FloatLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False)
+                elif transform.__class__.__name__ == "Albumentations":
+                    # 通用库的uint8/三通道增强不允许碰深度；传感器增强在上述取样阶段完成。
+                    composition.transforms[index] = Compose([])
+
+        replace_geometry(transforms)
+        return transforms
+
+
 class QualityMosaic(Mosaic):
     """保留原生四图布局与标签变换，空白区只有RGB填114。"""
 
@@ -325,6 +422,8 @@ class FusionRecipe:
     split_stem: bool = False
     # 与epochs学习率日程解耦；None保持历史行为，预算结束仍保存当轮完整产物。
     budget_epochs: int | None = None
+    continuous_depth: bool = False
+    sensors: SensorAugment = SensorAugment()
 
 
 def sampling_group(path: str) -> str:
@@ -734,6 +833,7 @@ class FusionDetectionTrainer(DetectionTrainer):
         self.early_fusion = recipe.architecture in {"early_v10", "rgb_v20"}
         self.quality_fusion = recipe.architecture == "quality_v19"
         self.native_square = recipe.geometry == "native_square"
+        self.continuous_depth = recipe.continuous_depth
         self.recipe_version = EARLY_FUSION_VERSION if self.early_fusion else FUSION_VERSION
         if recipe.split_stem:
             self.recipe_version = SPLIT_STEM_VERSION
@@ -745,6 +845,13 @@ class FusionDetectionTrainer(DetectionTrainer):
         self.resume_metadata: dict[str, Any] | None = None
         self.parent_initialization: dict[str, Any] | None = None
         super().__init__(*args, **kwargs)
+        if self.continuous_depth:
+            if (recipe.architecture != "early_v10" or not self.native_square or recipe.split_stem or
+                    self.args.resume or recipe.training_stage != "main" or self.args.amp or self.args.cache or
+                    self.args.augmentations is not None or any(getattr(self.args, key) != 0 for key in
+                    ("mixup", "cutmix", "copy_paste", "hsv_h", "hsv_s", "hsv_v", "bgr"))):
+                raise ValueError("新浮点训练要求早期融合/原生方形/FP32/官方基底，不恢复历史训练或叠加非传感器颜色增强")
+            configure_fp32()
         if self.args.imgsz != recipe.image_width or self.args.rect or self.args.multi_scale:
             raise ValueError("imgsz须等于配方宽度；训练rect和multi_scale须关闭")
         expected_hw = (self.args.imgsz, self.args.imgsz) if self.native_square else (1080, 1920)
@@ -950,6 +1057,8 @@ class FusionDetectionTrainer(DetectionTrainer):
                 model.initialize_auxiliary_from_rgb()
                 LOGGER.info("v19迁移：IR第0–4层继承RGB（首层通道求和）；Depth首层32个值滤波器继承RGB，支持权重零初始化可训练")
         model.content_hw = (self.recipe.image_height, self.recipe.image_width)
+        if self.continuous_depth:
+            model.preprocess_version = FLOAT_PREPROCESS_VERSION
         if self.rgb_diagnostic:
             LOGGER.info("v20实际网络首层输入3通道；构建期间显示的五通道摘要仅为保留v14初始化顺序，非最终结构")
         if self.resume_metadata:
@@ -1013,6 +1122,7 @@ class FusionDetectionTrainer(DetectionTrainer):
     def build_dataset(self, img_path: str, mode: str = "train", batch: int | None = None) -> MultimodalYOLODataset:
         if self.native_square:
             dataset_type = (RGBDiagnosticDataset if self.rgb_diagnostic else
+                            FloatYOLODataset if self.continuous_depth else
                             QualityYOLODataset if self.quality_fusion else MultimodalYOLODataset)
             return dataset_type(
                 img_path=img_path, imgsz=self.args.imgsz, batch_size=batch,
@@ -1020,6 +1130,7 @@ class FusionDetectionTrainer(DetectionTrainer):
                 single_cls=False, stride=32, pad=0.0, prefix=f"{mode}: ", task="detect",
                 classes=None, data=self.data, fraction=1.0,
                 polish_scale=self.recipe.polish_scale, polish_translate=self.recipe.polish_translate,
+                **({"sensors": self.recipe.sensors} if self.continuous_depth else {}),
             )
         return RectangularDataset(img_path=img_path, imgsz=self.args.imgsz, batch_size=batch,
                                   augment=mode == "train", hyp=copy(self.args), rect=False, cache=False,
@@ -1141,9 +1252,11 @@ class FusionDetectionTrainer(DetectionTrainer):
 
     def _setup_train(self) -> None:
         super()._setup_train()
+        if self.continuous_depth:
+            configure_fp32()
         start = 1 if self.early_fusion or self.quality_fusion else self.epochs - self.args.close_mosaic + 1
         self.stopper = PolishEarlyStopping(start, self.args.patience, self.recipe.min_delta, self.recipe.min_stop_epochs)
-        files = ("train1.py", "src/yolo/aic/__init__.py", "src/yolo/aic/model.py", "src/yolo/aic/training.py", "src/yolo/aic/data.py")
+        files = ("train1.py", "src/modalities.py", "src/yolo/aic/__init__.py", "src/yolo/aic/model.py", "src/yolo/aic/training.py", "src/yolo/aic/data.py")
         # main.py允许只改RESUME_PATH和资源参数，配方本身另行比较；组件源码不可偷偷变化。
         sources = {name: file_hash(PROJECT_ROOT / name) for name in files if name != "train1.py"}
         package = Path(ultralytics.__file__).parent
@@ -1162,6 +1275,13 @@ class FusionDetectionTrainer(DetectionTrainer):
                                    "recipe": asdict(self.recipe), "hyp": settings,
                                    "audit": self.audit, "sources": sources, "framework": framework,
                                    "parent_initialization": self.parent_initialization}
+        if self.continuous_depth:
+            self.training_signature["float_preprocessing"] = {
+                "version": FLOAT_PREPROCESS_VERSION, "host_dtype": "float32", "host_range": [0, 255],
+                "network_range": [0, 1], "depth_mm_range": [0, 20000],
+                "invalid_depth": "zero_or_above_20000", "padding": [114, 114, 114, 0, 0],
+                "precision": "FP32_no_autocast_no_tf32", "checkpoint_dtype": "float32",
+            }
         if self.rgb_diagnostic:
             self.training_signature["diagnostic"] = {
                 "submission_candidate": False, "network_channels": ["R", "G", "B"],
@@ -1194,7 +1314,7 @@ class FusionDetectionTrainer(DetectionTrainer):
             {**self.training_signature, "content_hw": [self.recipe.image_height, self.recipe.image_width],
              "tensor_hw": canvas_shape((self.recipe.image_height, self.recipe.image_width)),
              "validation_geometry": validation_geometry,
-             "validation_padding": [114] * 3 if self.rgb_diagnostic else [114, 114, 114, 0, 0, 0] if self.quality_fusion else [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
+             "validation_padding": [114, 114, 114, 0, 0] if self.continuous_depth else [114] * 3 if self.rgb_diagnostic else [114, 114, 114, 0, 0, 0] if self.quality_fusion else [114] * 5 if self.native_square else [114, 114, 114, 0, 0],
              "polish_start_epoch": 1 if self.recipe.training_stage == "polish" else self.epochs - self.args.close_mosaic + 1,
              "head_loss_weights": [0.8, 0.2], "validation_precision": "FP32",
              "initialization": self.parent_initialization["kind"] if self.parent_initialization else
@@ -1336,7 +1456,29 @@ class FusionDetectionTrainer(DetectionTrainer):
                  "stop_best": self.stopper.best, "stop_wait": self.stopper.wait, "completed": bool(self.stop)}
         for model in (unwrap_model(self.model), self.ema.ema):
             model.fusion_training = deepcopy(state)
-        result = super().save_model()
+        if self.continuous_depth:
+            ema = deepcopy(self.ema.ema).float().to(memory_format=torch.contiguous_format)
+            ema.criterion = None
+            if not all(torch.isfinite(value).all() for value in ema.state_dict().values()):
+                raise FloatingPointError("EMA含非有限参数，拒绝伪造有效检查点")
+            checkpoint = {"epoch": self.epoch, "best_fitness": self.best_fitness, "model": None,
+                          "ema": ema, "updates": self.ema.updates,
+                          "optimizer": deepcopy(self.optimizer.state_dict()), "scaler": self.scaler.state_dict(),
+                          "train_args": vars(self.args), "train_metrics": {**self.metrics, "fitness": self.fitness},
+                          "train_results": self.read_results_csv(), "date": datetime.now().astimezone().isoformat(),
+                          "version": ultralytics.__version__, "preprocess": FLOAT_PREPROCESS_VERSION,
+                          "precision": "FP32", "license": "AGPL-3.0"}
+            buffer = io.BytesIO()
+            torch.save(checkpoint, buffer)
+            self.wdir.mkdir(parents=True, exist_ok=True)
+            self.last.write_bytes(buffer.getvalue())
+            if self.best_fitness == self.fitness:
+                self.best.write_bytes(buffer.getvalue())
+            if self.save_period > 0 and (self.epoch + 1) % self.save_period == 0:
+                (self.wdir / f"epoch{self.epoch + 1}.pt").write_bytes(buffer.getvalue())
+            result = True
+        else:
+            result = super().save_model()
         if result and better50:
             shutil.copy2(self.last, self.wdir / "best_map50.pt")
         return result

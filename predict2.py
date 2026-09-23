@@ -9,25 +9,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import torch
-
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 DEFAULT_WEIGHTS: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_dfine_l_1280_v6/weights/best.pth"
 DEFAULT_SOURCE: Path = PROJECT_ROOT / "datasets" / "test"
 DEFAULT_OUTPUT: Path = PROJECT_ROOT / "历史产出" / "复赛_v6"
-
-
-def infer_imgsz(weights: Path, fallback: int = 1536) -> int:
-    """从D-FINE检查点读取训练输入尺寸，读取失败时使用兼容默认值。"""
-    try:
-        checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
-        config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
-        value = config.get("imgsz")
-        if isinstance(value, int) and value > 0:
-            return value
-    except (OSError, RuntimeError, TypeError, ValueError, KeyError):
-        pass
-    return fallback
 
 
 def main() -> None:
@@ -38,16 +23,13 @@ def main() -> None:
     # 预测实现与训练入口分开；predict1 不会被默认调用。
     from predict1 import PredictionConfig, predict
 
-    # D-FINE的位置编码和锚点必须使用训练时尺寸；从权重自动读取，避免手工同步。
-    model_imgsz = infer_imgsz(DEFAULT_WEIGHTS)
-
     predict(PredictionConfig(
         weights=DEFAULT_WEIGHTS,
         source=DEFAULT_SOURCE,
         output=DEFAULT_OUTPUT,
         backend="dfine",
         expected_count=1000,
-        imgsz=model_imgsz,
+        imgsz=0,  # CLI解析后从最终权重读取训练尺寸，缺失报错，不默认猜1536
         batch=4,
         workers=8,
         save_workers=8,

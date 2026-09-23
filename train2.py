@@ -1,26 +1,79 @@
-"""D-FINE 独立训练入口。
+"""执行D-FINE-L真实五通道连续浮点训练，不调用官方RGB数据入口。
 
-所有 D-FINE 源码位于 ``src/D-FINE``；本入口只负责把命令行参数转交给
-官方 ``train.py``，不导入 YOLO 训练器或 ``src/yolo``。
-
-示例：
-    uv run python train2.py -c src/D-FINE/configs/dfine/include/dfine_hgnetv2.yml --output-dir runs/dfine
-    uv run python train2.py -c <配置文件> -r <D-FINE检查点>
+运行：uv run python train2.py
+读取datasets清洗副本，不修改图像和标签；历史权重仅保留预测，不恢复旧训练。
 """
 
-from __future__ import annotations
-
-import runpy
+# 内置库
+import os
 import sys
 from pathlib import Path
 
-
+# 必须在导入训练依赖前关闭下载与遥测。
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["YOLO_OFFLINE"] = "true"
+os.environ["YOLO_AUTOINSTALL"] = "false"
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-DFINE_ROOT: Path = PROJECT_ROOT / "src" / "D-FINE"
+# 项目src优先；官方src路径由共用构建器扩展，避免遮蔽项目包。
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(1, str(PROJECT_ROOT / "src" / "D-FINE"))
+
+# 自己的模块
+from aic_training import TrainingConfig, train
+from src.modalities import SensorAugment
 
 
+# Windows子进程只导入配置和类，不重复启动训练。
 if __name__ == "__main__":
-    if not (DFINE_ROOT / "train.py").is_file():
-        raise FileNotFoundError(f"缺少D-FINE源码：{DFINE_ROOT}")
-    sys.path.insert(0, str(DFINE_ROOT))
-    runpy.run_path(str(DFINE_ROOT / "train.py"), run_name="__main__")
+    train(TrainingConfig(
+        # 一、模型、数据与训练时长
+        model="orgin_models/dfine_l_obj365_e25.pth",  # 本地官方366输出槽Objects365基底
+        data="datasets/data.yaml",  # 沿用1709/291清洗副本，不改标签
+        project="runs/detect",  # 与历史运行并存
+        name="AIC_RGBIRDepth_dfine_l_1280_v25_float",  # 新协议不得覆盖v6–v8
+        epochs=60,  # 固定短日程，结合轮末AP95早停
+        resume=None,  # 不接收旧优化器或旧预处理断点
+        data_audit="runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json",
+
+        # 二、设备、精度与加载：不自动探测资源
+        imgsz=1280,  # 与v6同尺度，不叠加1536分辨率变量
+        batch=2,  # 全FP32显存未实测，用户可调整
+        effective_batch=16,  # 8批累积，尾组按实际样本数归一化
+        val_batch=1,  # 验证与预测均FP32，无额外独立复评
+        workers=4,  # 每进程预取1批，关闭锁页和完整数据缓存
+        device=0,  # 本地CUDA设备；适配器关闭AMP与TF32
+        seed=0,  # 固定种子，不宣称跨设备逐位一致
+
+        # 三、优化器和收敛
+        lr0=0.0001,  # 以复赛v6主学习率为起点
+        backbone_lr=0.00001,  # 骨干低学习率，新增首层用主学习率
+        lrf=0.01,  # 余弦末端比例
+        warmup_epochs=3,  # 新类别与新增模态短预热
+        weight_decay=0.0001,  # 偏置及一维参数不衰减
+        clip_grad=0.1,  # 非有限梯度报错
+        ema_decay=0.999,  # 同一训练轨迹EMA，不做多模型集成
+        ema_warmup=100,  # 按真实优化步计数
+
+        # 四、同步几何与传感器增强
+        polish_epoch=40,  # 第41轮关闭尺度扰动；温和传感器扰动保留
+        scale_min=0.9,  # 只缩小后填充，不裁掉目标
+        fliplr=0.5,  # 三模态与标签同步翻转
+        hsv_h=0.01,  # RGB专用浮点HSV，不修改IR和深度
+        hsv_s=0.15,  # 温和RGB饱和度
+        hsv_v=0.15,  # 温和RGB亮度
+        sensors=SensorAugment(),  # IR增益/噪声；深度有效区小扰动与稀疏缺失
+
+        # 五、D-FINE损失与权重留存
+        loss_vfl=1.0,  # 官方分类权重，不搬YOLO的cls
+        loss_bbox=5.0,  # 原生L1框损失
+        loss_giou=2.0,  # 原生GIoU
+        loss_fgl=0.15,  # 原生细粒度定位
+        loss_ddf=1.5,  # 原生分布蒸馏，不是外部老师模型
+        conf=0.001,  # AP低分候选，非展示阈值
+        max_det=100,  # 赛事每图上限，查询排序不使用YOLO NMS
+        patience=15,  # 轮末AP95无有效提升则停止
+        min_delta=0.0005,  # 仅影响早停，真实最高AP仍留best
+        save_period=5,  # FP32检查点，不转成FP16
+        domain_metrics=True,  # 复用同次验证计算PNG/JPG分域指标
+    ))
