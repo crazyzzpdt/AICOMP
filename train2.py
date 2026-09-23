@@ -31,7 +31,7 @@ if __name__ == "__main__":
         model="orgin_models/dfine_l_obj365_e25.pth",  # 本地官方366输出槽Objects365基底
         data="datasets/data.yaml",  # 沿用1709/291清洗副本，不改标签
         project="runs/detect",  # 与历史运行并存
-        name="AIC_RGBIRDepth_dfine_l_1280_v25_float",  # 新协议不得覆盖v6–v8
+        name="AIC_RGBIRDepth_dfine_l_1280_v26_illumination",  # 独立增强配方，不覆盖v25
         epochs=60,  # 固定短日程，结合轮末AP95早停
         resume=None,  # 不接收旧优化器或旧预处理断点
         data_audit="runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json",
@@ -62,7 +62,11 @@ if __name__ == "__main__":
         hsv_h=0.01,  # RGB专用浮点HSV，不修改IR和深度
         hsv_s=0.15,  # 温和RGB饱和度
         hsv_v=0.15,  # 温和RGB亮度
-        sensors=SensorAugment(),  # IR增益/噪声；深度有效区小扰动与稀疏缺失
+        sensors=SensorAugment(
+            ir_gamma_probability=0.25,  # 指数0.8–1.2，不施加到深度
+            ir_local_probability=0.25,  # 有上限的浮点局部对比度，不转整数图
+            rgb_exposure_probability=0.25,  # RGB亮度域扰动，不当作真实夜间数据
+        ),  # 保留IR传感器噪声与深度扰动；验证预测不随机增强
 
         # 五、D-FINE损失与权重留存
         loss_vfl=1.0,  # 官方分类权重，不搬YOLO的cls

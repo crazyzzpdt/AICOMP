@@ -1,6 +1,6 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-v25采用连续FP32深度和温和传感器增强，保留1280及清洗版1709/291。
+v26在连续FP32基础上加入红外Gamma/局部对比度与RGB曝光扰动，保留1280及1709/291。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
 
@@ -42,7 +42,7 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v25_float"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v26_illumination"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 保留v14学习率日程，不能把此值改成20来代替预算停止。
@@ -62,7 +62,11 @@ if __name__ == "__main__":
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
         architecture="early_v10",  # RGB3+IR1+Depth1五通道共享骨干，作为正式三模态候选
         continuous_depth=True,  # 原始16位深度直接转FP32，不经过8位取整
-        sensors=SensorAugment(),  # 温和IR增益/噪声与深度有效区扰动，仅训练时启用
+        sensors=SensorAugment(
+            ir_gamma_probability=0.25,  # 指数0.8–1.2，保留原图训练比例
+            ir_local_probability=0.25,  # 浮点局部对比度；增益和改变量受限
+            rgb_exposure_probability=0.25,  # 模拟亮度变化，不声称替代真实夜间样本
+        ),  # 保留深度有效区扰动；这些随机增强不用于验证/推理
         split_stem=False,  # 不引入v18拆分首层或v19分支
         budget_epochs=BUDGET_EPOCHS,  # 允许完整200轮日程，避免把第20轮误判为最终上限
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径

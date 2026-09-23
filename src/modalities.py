@@ -40,6 +40,10 @@ class SensorAugment:
     depth_noise_distance: float = 0.0015
     depth_dropout_probability: float = 0.1
     depth_dropout_fraction: float = 0.005
+    # 默认关闭新增配方，由v26入口显式开启，不改变v25配置含义。
+    ir_gamma_probability: float = 0.0
+    ir_local_probability: float = 0.0
+    rgb_exposure_probability: float = 0.0
 
     def __post_init__(self) -> None:
         for name, value in vars(self).items():
@@ -128,10 +132,39 @@ def letterbox_float(image: np.ndarray, imgsz: int, *, native: bool = False,
     return canvas, (nw / w, nh / h, left, top)
 
 
+def enhance_ir_local(ir: np.ndarray) -> np.ndarray:
+    """限制局部细节增益及幅度，保持FP32，不使用整数直方图均衡。
+
+    Args:
+        ir: 0–1范围单通道红外图。
+
+    Returns:
+        连续浮点局部对比度增强结果；不是温度校正或热伪目标检测。
+    """
+    mean = cv2.GaussianBlur(ir, (0, 0), sigmaX=5.0)
+    variance = np.maximum(cv2.GaussianBlur(ir * ir, (0, 0), sigmaX=5.0) - mean * mean, 0.0)
+    std = np.sqrt(variance)
+    # 平坦区接近零增益；有纹理时温和增强，避免无上限放大暗区噪声。
+    reliability = std / (std + 0.02)
+    detail = np.clip((ir - mean) * (0.3 * reliability), -0.05, 0.05)
+    return np.clip(ir + detail, 0.0, 1.0).astype(np.float32, copy=False)
+
+
 def augment_sensors(image: np.ndarray, metric_depth: bool, config: SensorAugment) -> np.ndarray:
     """只在训练使用，保留缺失深度，不改变三模态几何或标签。"""
     result = image.copy()
+    if config.rgb_exposure_probability and np.random.random() < config.rgb_exposure_probability:
+        rgb = np.clip(result[:, :, :3] / 255.0, 0.0, 1.0)
+        # 整张RGB共享色调参数，保留色彩关系；不对IR或Depth套用RGB曝光。
+        rgb = np.power(rgb, np.float32(np.random.uniform(0.7, 1.8)))
+        rgb *= np.float32(np.random.uniform(0.6, 1.05))
+        rgb += np.random.normal(0.0, 0.003, rgb.shape).astype(np.float32)
+        result[:, :, :3] = np.clip(rgb, 0.0, 1.0) * 255.0
     ir = result[:, :, 3] / 255.0
+    if config.ir_gamma_probability and np.random.random() < config.ir_gamma_probability:
+        ir = np.power(np.clip(ir, 0.0, 1.0), np.float32(np.random.uniform(0.8, 1.2)))
+    if config.ir_local_probability and np.random.random() < config.ir_local_probability:
+        ir = enhance_ir_local(ir)
     if np.random.random() < config.ir_probability:
         ir = ir * np.random.uniform(1 - config.ir_gain, 1 + config.ir_gain) + np.random.uniform(-config.ir_bias, config.ir_bias)
     if np.random.random() < config.ir_noise_probability:
