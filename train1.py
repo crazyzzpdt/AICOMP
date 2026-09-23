@@ -1,6 +1,6 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-v26在连续FP32基础上加入红外Gamma/局部对比度与RGB曝光扰动，保留1280及1709/291。
+v25在连续FP32基础上加入红外Gamma/局部对比度与RGB曝光扰动，保留1280及1709/291。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
 
@@ -42,7 +42,7 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v26_illumination"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v25_illumination"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 保留v14学习率日程，不能把此值改成20来代替预算停止。

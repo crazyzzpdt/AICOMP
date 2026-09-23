@@ -31,7 +31,7 @@ if __name__ == "__main__":
         model="orgin_models/dfine_l_obj365_e25.pth",  # 本地官方366输出槽Objects365基底
         data="datasets/data.yaml",  # 沿用1709/291清洗副本，不改标签
         project="runs/detect",  # 与历史运行并存
-        name="AIC_RGBIRDepth_dfine_l_1280_v26_illumination",  # 独立增强配方，不覆盖v25
+        name="AIC_RGBIRDepth_dfine_l_1280_v25_illumination",  # 待训练v25完整配方，不覆盖历史产物
         epochs=60,  # 固定短日程，结合轮末AP95早停
         resume=None,  # 不接收旧优化器或旧预处理断点
         data_audit="runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json",

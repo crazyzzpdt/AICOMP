@@ -40,7 +40,7 @@ class SensorAugment:
     depth_noise_distance: float = 0.0015
     depth_dropout_probability: float = 0.1
     depth_dropout_fraction: float = 0.005
-    # 默认关闭新增配方，由v26入口显式开启，不改变v25配置含义。
+    # 新增增强默认关闭，由待训练v25入口显式开启。
     ir_gamma_probability: float = 0.0
     ir_local_probability: float = 0.0
     rgb_exposure_probability: float = 0.0
