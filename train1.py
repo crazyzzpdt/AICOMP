@@ -1,10 +1,10 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-保留v14的1280输入、初始化顺序、增强、骨干学习率和清洗版1709/291。
+v24以v21为对照，保留1280输入、初始化顺序、增强和清洗版1709/291，各组学习率减半。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
-保留200轮学习率日程，第20轮验证和保存后因预算停止，不改成20轮快速衰减。
+保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
 
-由用户启动诊断训练：
+由用户启动训练：
     uv run python train1.py
 本轮不生成赛事提交包，predict1.py负责YOLO预测。
 中断恢复：
@@ -43,13 +43,13 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_early_fusion_v21"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v24_lower_lr"
 # 保留v4的1280方形训练增强；当前固定方形验证不等于v4旧矩形验证。
 IMAGE_HW: tuple[int, int] = (1280, 1280)
 # 保留v14学习率日程，不能把此值改成20来代替预算停止。
 MAX_EPOCHS: int = 200
-# 获取完整前20轮轨迹后人工决策，不因AP初值低提前丢弃对照。
-BUDGET_EPOCHS: int = 20
+# 五通道模型需覆盖v4约100轮的收敛区间，最多运行200轮。
+BUDGET_EPOCHS: int = 200
 # 首训保持None，仅恢复相同配方中断状态，已完成模型拒绝恢复。
 RESUME_PATH: str | None = None
 
@@ -62,7 +62,7 @@ if __name__ == "__main__":
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
         architecture="early_v10",  # RGB3+IR1+Depth1五通道共享骨干，作为正式三模态候选
         split_stem=False,  # 不引入v18拆分首层或v19分支
-        budget_epochs=BUDGET_EPOCHS,  # 第20轮验证与保存后停止，学习率仍按200轮衰减
+        budget_epochs=BUDGET_EPOCHS,  # 允许完整200轮日程，避免把第20轮误判为最终上限
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
         min_stop_epochs=20,  # 保留v14最低耐心停止轮数；阶段筛选独立生效
         initial_weights_sha256=None,  # 无微调父权重，训练器仍记录实际初始化来源
@@ -70,13 +70,13 @@ if __name__ == "__main__":
         image_width=IMAGE_HW[0],  # 与下方imgsz一致
         backbone_lr=0.0001,  # 历史v9专用，本轮骨干由early_backbone_lr指定
         auxiliary_lr=0.0001,  # 配方兼容字段，本轮没有辅助分支参数
-        early_backbone_lr=0.00002,  # 与v14一致：第1–10层使用0.2倍学习率
+        early_backbone_lr=0.00001,  # v21骨干2e-5减半，保持骨干与检测头0.2倍比例
         val_batch=1,  # 与v14正式训练轨迹一致，不拿batch2复评替代逐轮对照
         min_delta=0.0,  # 沿用v14，真实AP95新高即可重置耐心
         polish_scale=None,  # 第101轮只关Mosaic，保留v14的scale=0.3
         polish_translate=None,  # 关闭拼图后仍保留translate=0.1，与v14相同
         screening_thresholds=(),  # 本轮仅预算停止，记录budget_history.csv，不按AP硬门槛中断
-        geometry="native_square",  # 五模态通道同步缩放、增强与114补边
+        geometry="native_square",  # 三模态五通道同步缩放、增强与114补边
         data_audit=DATA_AUDIT,  # 使用最近一次已落位审计
         repeat_threshold=0.0,  # v17未改善总体AP95，关闭受限重复，回到v14基本采样
     ))
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         cfg=None,  # 不使用额外覆盖配置文件，所有参数在此处显式给出
         project=PROJECT_PATH,  # 正式训练产物根目录
         name=RUN_NAME,  # 重名自动另建目录，预测时填写实际路径
-        epochs=MAX_EPOCHS,  # 200轮学习率日程；budget_epochs=20单独控制实际停止
+        epochs=MAX_EPOCHS,  # 200轮余弦日程，无20轮预算截断
         time=None,  # 不按小时强制截断，训练由epochs和早停控制
         resume=RESUME_PATH or False,  # 仅恢复同配方中断检查点
         pretrained=True,  # 官方COCO预训练迁移，不加载历史赛事权重续训
@@ -118,7 +118,7 @@ if __name__ == "__main__":
 
         # 三、优化器、学习率与收敛
         optimizer="AdamW",  # 沿用v4优化器，不用auto切换
-        lr0=0.0001,  # 与v14一致：RGB首层/颈部/双头1e-4，骨干2e-5
+        lr0=0.00005,  # v21首层/颈部/双头1e-4减半，检验早期更新幅度是否过大
         lrf=0.01,  # 恢复v14的200轮余弦末端为初始学习率1%
         cos_lr=True,  # 不继续v16的60轮快速衰减组合
         momentum=0.9,  # AdamW第一动量系数
@@ -130,7 +130,7 @@ if __name__ == "__main__":
 
         # 四、同步增强与关闭拼图阶段
         mosaic=0.5,  # 沿用v14概率与五通道114补边，三模态同步增强
-        close_mosaic=100,  # 日程中第101轮关闭，本轮20轮预算不会进入收尾
+        close_mosaic=100,  # 最后100轮关闭：200轮日程第101轮起收尾，与v21计划一致
         scale=0.3,  # 沿用v14同步几何幅度
         translate=0.1,  # 沿用v14平移幅度，关闭拼图后保持不变
         fliplr=0.5,  # 训练和收尾均保留同步水平翻转
@@ -141,7 +141,7 @@ if __name__ == "__main__":
         degrees=0.0,  # 不增加旋转
         shear=0.0,  # 不增加剪切形变
         perspective=0.0,  # 不增加透视形变
-        bgr=0.0,  # 五通道Format保持顺序，格式化后取前三通道，避免RGB再次翻转
+        bgr=0.0,  # 保持RGB、IR、Depth五通道顺序，不进行颜色通道反转
         mixup=0.0,  # 不叠加样本混合
         cutmix=0.0,  # 不叠加额外裁剪粘贴
         copy_paste=0.0,  # 不复制粘贴目标，本轮也关闭受限采样
@@ -150,7 +150,7 @@ if __name__ == "__main__":
         # 五、类别与损失
         box=7.5,  # 沿用YOLO定位损失量级，不移植D-FINE权重
         cls=0.5,  # 原生分类损失，不人为抬高某类预测分数
-        cls_pw=0.0,  # 沿用v14，不额外叠加类别频率加权
+        cls_pw=0.0,  # 回到v21的无额外类别加权；v22/23没有证明加权改善总体AP
         dfl=1.5,  # YOLO26无传统DFL，此值实际加权归一化框距离的L1损失
         single_cls=False,  # 保留赛事12类
         classes=None,  # 不过滤ball等弱类
@@ -171,7 +171,7 @@ if __name__ == "__main__":
         iou=0.7,  # 验证与预测共享单标签NMS
         nms=True,  # 正式输出使用一对多分支，不融合两头预测
         max_det=100,  # 赛事单图最多100框
-        patience=40,  # 沿用v14耐心，无新高不因200轮上限强行跑满
+        patience=30,  # 连续30轮无AP95新高停止，避免再等待100轮退化阶段
         save=True,  # 保留best、best_map50及last
         save_period=5,  # 每5轮留存，最佳/末轮权重和逐类指标照常保存
         plots=True,  # 保留原生曲线、混淆矩阵和样本可视化

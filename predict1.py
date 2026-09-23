@@ -190,12 +190,15 @@ def check_dfine_source() -> Path:
         source = PROJECT_ROOT / "vendor" / "D-FINE"
     if not (source / "src/core/yaml_config.py").is_file():
         raise FileNotFoundError("缺少 vendor/D-FINE，请先按 docs/归档/01_早期训练与清洗.md 的D-FINE章节准备官方源码")
-    revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"],
-                           check=True, capture_output=True, text=True).stdout.strip()
-    if revision != DFINE_COMMIT or dirty:
-        raise ValueError(f"官方源码版本不符或被修改：{revision}；请使用文档指定的未修改版本")
+    # 仓库内的D-FINE源码是随项目提交的目录副本，不一定带独立.git；避免误读项目根提交。
+    git_dir = source / ".git"
+    if git_dir.exists():
+        revision = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", str(source), "status", "--porcelain", "--untracked-files=no"],
+                               check=True, capture_output=True, text=True).stdout.strip()
+        if revision != DFINE_COMMIT or dirty:
+            raise ValueError(f"官方源码版本不符或被修改：{revision}；请使用文档指定的未修改版本")
     if str(source) not in sys.path:
         sys.path.insert(0, str(source))
     return source
@@ -211,7 +214,15 @@ def build_dfine_model(imgsz: int) -> nn.Module:
         与历史检查点结构一致的五通道模型。
     """
     source = check_dfine_source()
+    # 项目自身也有src包；扩展同一包的搜索路径，使D-FINE内部的src.core保持原始导入语义。
+    import src as project_src
+    dfine_src = str(source / "src")
+    if dfine_src not in project_src.__path__:
+        project_src.__path__.append(dfine_src)
     from src.core import YAMLConfig
+    # 导入D-FINE注册模块，填充YAML构建器所需的全局组件表。
+    import src.nn  # noqa: F401
+    import src.zoo.dfine  # noqa: F401
 
     config = YAMLConfig(
         str(source / "configs/dfine/include/dfine_hgnetv2.yml"),
