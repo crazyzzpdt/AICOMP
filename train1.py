@@ -1,6 +1,7 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-v26对照已完成的v25：关闭新增三项亮度增强，保留FP32、batch1、1280及1709/291。
+v26对照已完成的v25：关闭新增三项亮度增强，保留FP32、batch1和1280。
+当前数据按赛事方答复恢复为官方原始标签，使用1700/300划分，不再应用历史标签清洗。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
 
@@ -36,10 +37,10 @@ from src.modalities import SensorAugment, configure_fp32
 
 # 使用官方RGB预训练权重迁移到五通道首层，不续训历史赛事权重。
 MODEL_PATH: str = "./orgin_models/yolo26l.pt"
-# 沿用已审计的官方新版标签与1709/291划分，不重新生成图像副本。
+# 使用官方新版标签原文与1700/300划分；审计只验证内容，不修订标签。
 DATA_PATH: str = "./datasets/data.yaml"
 # 开训核对图像清单、标签指纹和清洗来源，不自动改标签。
-DATA_AUDIT: str = "./runs/dataset_cleaning/official_refresh_20260918_214843/manifest.json"
+DATA_AUDIT: str = "./runs/dataset_cleaning/official_labels_split_1700_300_20260924/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
 RUN_NAME: str = "AIC_RGBIRDepth_yolo26l_1280_v26_no_tone"
