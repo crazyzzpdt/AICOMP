@@ -9,7 +9,12 @@ Copyright (c) 2023 lyuwenyu. All Rights Reserved.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from src.dfine.runtime import check_source
+
+check_source()
 
 import torch
 import torch.nn as nn
@@ -106,7 +111,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--config",
         "-c",
-        default="configs/dfine/dfine_hgnetv2_l_coco.yml",
+        default=str(Path(__file__).resolve().parents[3] / "src/D-FINE/configs/dfine/dfine_hgnetv2_l_coco.yml"),
         type=str,
     )
     parser.add_argument(

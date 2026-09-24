@@ -1,7 +1,7 @@
 """执行D-FINE-L真实五通道连续浮点训练，不调用官方RGB数据入口。
 
 运行：uv run python train2.py
-读取datasets清洗副本，不修改图像和标签；历史权重仅保留预测，不恢复旧训练。
+读取datasets官方原标签副本，不修改图像和标签；历史权重仅保留预测，不恢复旧训练。
 """
 
 # 内置库
@@ -17,10 +17,9 @@ os.environ["YOLO_AUTOINSTALL"] = "false"
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 # 项目src优先；官方src路径由共用构建器扩展，避免遮蔽项目包。
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(1, str(PROJECT_ROOT / "src" / "D-FINE"))
 
 # 自己的模块
-from aic_training import TrainingConfig, train
+from src.dfine.training import TrainingConfig, train
 from src.modalities import SensorAugment
 
 

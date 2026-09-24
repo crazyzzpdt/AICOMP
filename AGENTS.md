@@ -1,5 +1,7 @@
 # 仓库协作规范
 
+2026-09-24目录整理（当前结构优先）：根目录保留train1/train2/predict1/predict2四个入口；共享浮点预处理src/modalities.py、YOLO模型类src/yolo/aic路径保持（旧权重依赖）。D-FINE项目适配移到src/dfine/{training,runtime}.py，上游核心与配置留src/D-FINE，上游工具/reference移到根tools/dfine；旧src/tools/run_snapshots原样迁到tools/archive/run_snapshots，仅本地追溯，Git忽略。移除无源码src/common、src/yolo/aic/aic及迁空src/tools；不得重新创建占位空包。runs/detect/code保持关联训练快照，其他runs内容为审计/日志/评估记录而非活动工具，全部保留；入口审计路径不变。当前官方原标签1700/300与训练数值不因整理改变。仅文本/Git核对，未测试/导入/训练/推理。用户授权提交推送本轮整理，已有内存修复和用户预测默认修改继续保留，不夹带进整理提交。新结构详见docs/代码结构与运行.md、src/README.md、tools/README.md。
+
 2026-09-24官方标签恢复（当前最高优先）：赛事方明确答复不能人工修改训练标签。用户已清空旧datasets，本轮已从`数据集/训练集/{visible,infrared,depth,new_labels_2000}`重建1700 train/300 val；三模态为官方源硬链接，2000份标签逐字节复制，SHA256不匹配0，不裁框、不去重、不改类、不排除疑似脏样本。新审计为`runs/dataset_cleaning/official_labels_split_1700_300_20260924/manifest.json`，train1/train2均已切换。历史修正标签2000份只保留在`cleaned_labels_archive_20260924`供追溯，不得训练；审计目录内8个IR/Depth图像目录已删除，约释放12.56 GiB逻辑空间。后续不得依据旧段落恢复1709/291清洗标签；新旧划分AP不可直接同口径比较。
 
 2026-09-24 v24最终复盘与现场状态：误删后现已重新取得v24完整产物，共72轮，best42 AP95=0.4008757256/AP50=0.6279537053，末轮AP95=0.38451；它是当前1709/291同协议训练峰值，高于v14/v21的0.39215，但第42轮后30轮未刷新最佳，存在后期过拟合，不从last盲目续训。若后续复用v24，只能从best.pt另开短周期低学习率收尾实验，并作为新版本独立比较。2026-09-24现场进程命令为`uv run train1.py`，实际输出目录与入口为v26_no_tone；v25已完成64轮，不得把活动训练误记为v25。当前训练期间不修改Python源码。

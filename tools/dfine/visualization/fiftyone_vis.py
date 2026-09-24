@@ -19,9 +19,13 @@ import tqdm
 from fiftyone import ViewField as F
 from PIL import Image
 
-from src.core import YAMLConfig
+from pathlib import Path
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from src.dfine.runtime import check_source
+
+check_source()
+from src.core import YAMLConfig
 
 
 def kill_existing_mongod():

@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+2026-09-24目录整理：保留根train1/train2/predict1/predict2入口；YOLO在src/yolo/aic，公共浮点处理src/modalities.py，D-FINE项目适配src/dfine/{training,runtime}.py，上游核心/配置src/D-FINE；工具统一tools/dfine及既有tools，历史源码tools/archive/run_snapshots（不入Git）。删除空common、重复aic/aic和迁空src/tools；runs审计、模型及日志保留。当前官方标签1700/300，不恢复历史清洗。此次不改变训练参数，不测试或运行模型；已有未提交内存修复及用户预测配置保留本地，目录变动与引用单独提交推送。
+
 2026-09-24 v24最终复盘：v24完成72轮，best42 AP95=0.4008757256/AP50=0.6279537053，末轮AP95=0.38451；它是1709/291同协议最高训练峰值，但best后30轮未刷新且训练损失继续下降，判定存在后期过拟合，不从last盲目续训。现场活动进程实际为v26_no_tone，v25已经完成。后续每个新版本代码完成后、启动训练前必须先创建独立Git提交；有推送授权时同步GitHub，且排除数据、权重、runs和用户无关文件。
 
 2026-09-24最新授权：v25已完成64轮、best34 AP95=0.3851467445，实际FP32/batch1。用户批准YOLO v26_no_tone，关闭新增IR Gamma/局部对比度/RGB曝光，保留其余v25配方及batch1/nbs16；patience改50，200轮上限。先提交代码文档再启动一次正式训练；不追加测试或独立评估、不自动重试。train2保持v25配置不启动，predict1用户改动保留不夹带。下面“当前v24/下一轮v25”为历史。

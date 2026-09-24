@@ -42,7 +42,7 @@ import yaml
 # 自己的模块
 from src.modalities import (CLASS_NAMES, IMAGE_SUFFIXES, FLOAT_PREPROCESS_VERSION, SensorAugment,
                             read_float_modalities, letterbox_float, augment_sensors, configure_fp32)
-from src.dfine_runtime import check_source, build_model, decode_predictions
+from src.dfine.runtime import check_source, build_model, decode_predictions
 
 
 # 固定官方源码版本，避免本机更新第三方仓库后静默改变训练行为。
@@ -446,7 +446,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     training = MultimodalDFineDataset(PROJECT_ROOT / config.data, "train", config)
     validation = MultimodalDFineDataset(PROJECT_ROOT / config.data, "val", config)
     adapter_hashes = {name: hashlib.sha256((PROJECT_ROOT / name).read_bytes()).hexdigest()
-                      for name in ("src/D-FINE/aic_training.py", "src/modalities.py", "src/dfine_runtime.py", "src/D-FINE/source_manifest.json")}
+                      for name in ("src/dfine/__init__.py", "src/dfine/training.py", "src/modalities.py", "src/dfine/runtime.py", "src/D-FINE/source_manifest.json")}
     if {p.stem for p in training.images} & {p.stem for p in validation.images}:
         raise ValueError("训练和验证存在同名样本，停止训练以避免泄漏")
     audit_hash: str | None = None
@@ -530,8 +530,8 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     snapshot.mkdir()
     if config.data_audit:
         shutil.copy2(PROJECT_ROOT / config.data_audit, output / "dataset_audit.json")
-    for filename in ("train2.py", "predict2.py", "predict1.py", "src/__init__.py", "src/D-FINE/aic_training.py",
-                     "src/D-FINE/source_manifest.json", "src/modalities.py", "src/dfine_runtime.py", "pyproject.toml", "uv.lock"):
+    for filename in ("train2.py", "predict2.py", "predict1.py", "src/__init__.py", "src/dfine/__init__.py", "src/dfine/training.py",
+                     "src/D-FINE/source_manifest.json", "src/modalities.py", "src/dfine/runtime.py", "pyproject.toml", "uv.lock"):
         target = snapshot / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT_ROOT / filename, target)

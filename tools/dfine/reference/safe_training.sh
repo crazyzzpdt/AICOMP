@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# 上游RGB/多GPU参考脚本，不是本项目三模态入口；从官方源码根目录解析配置。
+DFINE_SOURCE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../src/D-FINE" && pwd)" || exit 1
+cd -- "$DFINE_SOURCE" || exit 1
+
 # Function to display the menu for selecting model size
 select_model_size() {
     echo "Select model size:"

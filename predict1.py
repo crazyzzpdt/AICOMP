@@ -55,7 +55,7 @@ from ultralytics.utils import nms, ops
 
 # 自己的模块
 from src.modalities import FLOAT_PREPROCESS_VERSION, configure_fp32, read_float_modalities, letterbox_float
-from src.dfine_runtime import (check_source as check_dfine_runtime_source, build_model as build_dfine_runtime_model,
+from src.dfine.runtime import (check_source as check_dfine_runtime_source, build_model as build_dfine_runtime_model,
                                decode_predictions as decode_dfine_runtime_predictions)
 from src.yolo.aic.data import CLASS_NAMES, IMAGE_SUFFIXES, QUALITY_PREPROCESS_VERSION, fuse_modalities, fuse_quality_modalities
 from src.yolo.aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
@@ -692,7 +692,7 @@ def build_submission(output: Path, image_names: list[str]) -> Path:
 def prediction_source_hashes() -> dict[str, str]:
     """记录本次预测源码摘要，补材料时拒绝用后来修改的代码冒充原运行。"""
     paths = [("predict1.py", Path(__file__))]
-    paths.extend((name, PROJECT_ROOT / name) for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine_runtime.py",
+    paths.extend((name, PROJECT_ROOT / name) for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine/__init__.py", "src/dfine/runtime.py",
                                                         "src/D-FINE/source_manifest.json"))
     paths.extend((path.relative_to(PROJECT_ROOT).as_posix(), path)
                  for path in sorted((PROJECT_ROOT / "src" / "yolo" / "aic").glob("*.py")))
@@ -760,7 +760,7 @@ def export_round2_materials(config: PredictionConfig, metadata: dict[str, object
     copy_file(archive, root / "submission.zip")
     copy_file(config.output / "prediction.json", root / "prediction.json")
     copy_file(Path(__file__), code / "predict1.py")
-    for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine_runtime.py"):
+    for name in ("predict2.py", "src/__init__.py", "src/yolo/__init__.py", "src/modalities.py", "src/dfine/__init__.py", "src/dfine/runtime.py"):
         copy_file(PROJECT_ROOT / name, code / name)
     copy_sources(PROJECT_ROOT / "src" / "yolo" / "aic", code / "src" / "yolo" / "aic")
     copy_sources(PROJECT_ROOT / "docs", code / "docs")
@@ -776,11 +776,11 @@ def export_round2_materials(config: PredictionConfig, metadata: dict[str, object
         copy_sources(check_dfine_source(), code / "src" / "D-FINE")
     run = config.weights.parent.parent
     snapshot = run / "code"
-    archived_run = PROJECT_ROOT / "src" / "tools" / "run_snapshots" / run.relative_to(PROJECT_ROOT / "runs")
+    archived_run = PROJECT_ROOT / "tools" / "archive" / "run_snapshots" / run.relative_to(PROJECT_ROOT / "runs")
     archived_snapshot = archived_run / "code"
     if not snapshot.is_dir() and archived_snapshot.is_dir():
         snapshot = archived_snapshot
-    if (snapshot / "train1.py").is_file():
+    if (snapshot / "train1.py").is_file() or (snapshot / "train2.py").is_file():
         copy_sources(snapshot, code / "训练源码")
     elif (run / "train1.py").is_file() or (run / "main.py").is_file() or (archived_run / "train1.py").is_file() or (archived_run / "main.py").is_file():
         # v4/v5将源码直接留在运行根目录，只复制同层Python，不递归带入图像和权重。

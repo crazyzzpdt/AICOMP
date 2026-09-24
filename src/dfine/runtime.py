@@ -17,7 +17,7 @@ from torchvision.ops import box_convert
 from src.modalities import CLASS_NAMES
 
 DFINE_COMMIT: str = "956d1709314c2c6a4df6f34de232054578a7449f"
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
 
 
 def check_source() -> Path:

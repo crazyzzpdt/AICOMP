@@ -5,7 +5,12 @@ Copyright (c) 2024 The D-FINE Authors. All Rights Reserved.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from src.dfine.runtime import check_source
+
+check_source()
 
 import argparse
 
@@ -53,7 +58,7 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", "-c", default="configs/dfine/dfine_hgnetv2_l_coco.yml", type=str
+        "--config", "-c", default=str(Path(__file__).resolve().parents[3] / "src/D-FINE/configs/dfine/dfine_hgnetv2_l_coco.yml"), type=str
     )
     args = parser.parse_args()
 

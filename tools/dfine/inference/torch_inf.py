@@ -12,7 +12,12 @@ import torch.nn as nn
 import torchvision.transforms as T
 from PIL import Image, ImageDraw
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from src.dfine.runtime import check_source
+
+check_source()
 from src.core import YAMLConfig
 
 
