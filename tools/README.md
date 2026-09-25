@@ -1,5 +1,6 @@
 # 工具目录
 
+- `check_train1.py`：显式授权时用`uv run python -m tools.check_train1`检查真实入口的两轮少量批次、验证、保存及重载；输出`runs/train1_checks`，不等同完整训练或质量评估，不自动调用。
 - `prepare_dataset.py`：历史数据准备/审计工具。包含旧清洗逻辑；当前官方原标签1700/300已准备好，不要执行旧清洗重建。
 - `validate_local.py`：本地未纳入Git的历史291张验证工具，不能直接拿来评价当前300张验证集；本轮不修改、不运行。
 - `dfine/`：由 `src/D-FINE/tools`、`reference` 移入的上游导出、推理、数据处理与可视化示例。它们不是赛事五通道入口，数据示例也不应用来改写官方标签。

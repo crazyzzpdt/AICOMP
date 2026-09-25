@@ -1,6 +1,14 @@
 # 仓库协作规范
 
+2026-09-25预测入口隔离：predict1仅保留YOLO分组配置，src/yolo/prediction.py负责实现；predict2改为src/dfine/prediction.py，不导入predict1或src.yolo。src/prediction_io.py共用配对/有限预取/保存/ZIP/材料，不选择模型。YOLO入口列出参考文档全部预测参数；不适用的任务/格式参数显式拒绝非默认值，不能说全部选项均可开启。保留用户v26 best与v7 best权重、输出路径、FP32和训练一致输入协议；未改训练/数据/版本，未测试/导入执行检查/预测或提交。不得恢复混合入口或改变旧权重模型类路径；详情docs/预测与赛事提交.md。
+
+2026-09-25 v26正式完成与复赛记录（最新）：用户v26_no_tone正式运行已完成104轮、13.567小时，官方1700/300、FP32/batch2；best54 AP95=0.4121760546/AP50=0.6328956779，末轮0.38901，50轮无新高早停且后期过拟合，不再描述为运行中。截图复赛v26=48.2750、v24=48.4530、v7第二次=44.6810；复赛已知最高v6=49.8150，初赛与新旧验证划分分开。截图/本地TXT ZIP未独立核实所交检查点，不编造权重哈希。只更新复盘文档；未删图改标、测试、复评、训练、预测或提交。后续优先官方300张同口径对比、训练疑点定向审阅；旧57份修订=49 train/8 val，不是57张严重坏图。训练过滤需证据与单独清单，不动原文/验证集。v26 best短收尾仅方案，当前浮点训练器仍禁止旧权重重训，不能直接改路径开训；未分配新版本。详见docs/历次训练与赛事分数对比.md。
+
+2026-09-25 train1测试授权与结果：用户明确要求测试并修复，本轮已完成batch2/1280/FP32/worker2真实入口有界检查（两轮各4训练批+2验证批、6次优化步、保存及第二轮前向通过），23项CPU回归通过；详情docs/浮点三模态实施方案.md。未复现旧跨轮OOM，不宣称完整训练稳定；本轮无新生产算法修复，保留此前内存修复，仅修正过时测试和入口注释。batch2为用户本轮前已修改的值，不恢复旧batch1。工具为tools/check_train1.py，输出runs/train1_checks，不计新版本；未自动正式开训或提交。默认不因一次测试授权持续增加测试。
+
 2026-09-24目录整理（当前结构优先）：根目录保留train1/train2/predict1/predict2四个入口；共享浮点预处理src/modalities.py、YOLO模型类src/yolo/aic路径保持（旧权重依赖）。D-FINE项目适配移到src/dfine/{training,runtime}.py，上游核心与配置留src/D-FINE，上游工具/reference移到根tools/dfine；旧src/tools/run_snapshots原样迁到tools/archive/run_snapshots，仅本地追溯，Git忽略。移除无源码src/common、src/yolo/aic/aic及迁空src/tools；不得重新创建占位空包。runs/detect/code保持关联训练快照，其他runs内容为审计/日志/评估记录而非活动工具，全部保留；入口审计路径不变。当前官方原标签1700/300与训练数值不因整理改变。仅文本/Git核对，未测试/导入/训练/推理。用户授权提交推送本轮整理，已有内存修复和用户预测默认修改继续保留，不夹带进整理提交。新结构详见docs/代码结构与运行.md、src/README.md、tools/README.md。
+
+2026-09-24内存修复：batch1提供的堆栈为NumPy主机分配失败；历史两次batch2是在首轮验证成功后的第二轮首次训练前向CUDA分配失败，尚不能归因于验证batch。连续FP32增强已减少临时数组；浮点图像缓存改为仅保留Mosaic候选索引；train1 workers=2、浮点val workers=0，有限轮次加载器避免跨轮预取并在退出时关闭。检查点直接CPU快照+流式写盘，保留FP32，不再GPU deepcopy EMA/Adam和BytesIO整份副本。入口batch1/nbs16及学习率/精度/增强数值不变。362个Ultralytics文件符合安装RECORD，未改底层库；未运行测试或训练，不能宣称batch2已通过。当前官方标签1700/300，不恢复旧清洗断点。详见docs/浮点三模态实施方案.md。
 
 2026-09-24官方标签恢复（当前最高优先）：赛事方明确答复不能人工修改训练标签。用户已清空旧datasets，本轮已从`数据集/训练集/{visible,infrared,depth,new_labels_2000}`重建1700 train/300 val；三模态为官方源硬链接，2000份标签逐字节复制，SHA256不匹配0，不裁框、不去重、不改类、不排除疑似脏样本。新审计为`runs/dataset_cleaning/official_labels_split_1700_300_20260924/manifest.json`，train1/train2均已切换。历史修正标签2000份只保留在`cleaned_labels_archive_20260924`供追溯，不得训练；审计目录内8个IR/Depth图像目录已删除，约释放12.56 GiB逻辑空间。后续不得依据旧段落恢复1709/291清洗标签；新旧划分AP不可直接同口径比较。
 

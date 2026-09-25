@@ -86,7 +86,11 @@ def read_float_modalities(visible: Path, infrared: Path, depth: Path) -> tuple[n
         valid = (raw > 0) & (raw <= DEPTH_MAX_MM)
         depth_float = np.where(valid, depth_float * (255.0 / DEPTH_MAX_MM), 0.0)
     # 8位代理没有可恢复的毫米精度；不把插值后的浮点值宣传为新增传感器信息。
-    return np.dstack((rgb.astype(np.float32), ir_float, depth_float)).astype(np.float32), metric
+    result = np.empty((*ir.shape, 5), dtype=np.float32)
+    result[:, :, :3] = rgb
+    result[:, :, 3] = ir_float
+    result[:, :, 4] = depth_float
+    return result, metric
 
 
 def transform_float_image(image: np.ndarray,
@@ -98,9 +102,15 @@ def transform_float_image(image: np.ndarray,
     mass = operation(support, 0.0, cv2.INTER_LINEAR)
     valid = operation(support, 0.0, cv2.INTER_NEAREST) > 0.5
     numerator = operation(image[:, :, 4] * support, 0.0, cv2.INTER_LINEAR)
-    depth = np.divide(numerator, mass, out=np.zeros_like(numerator), where=(mass > 1e-6) & valid)
-    planes = [operation(image[:, :, c], 114.0 if c < 3 else 0.0, cv2.INTER_LINEAR) for c in range(4)]
-    return np.ascontiguousarray(np.clip(np.dstack((*planes, depth)), 0.0, 255.0), dtype=np.float32)
+    result = np.empty((*numerator.shape, 5), dtype=np.float32)
+    result[:, :, 4] = 0.0
+    np.divide(numerator, mass, out=result[:, :, 4], where=(mass > 1e-6) & valid)
+    # 深度中间量先释放，再逐通道写入，避免dstack与clip同时持有两份五通道画布。
+    del support, mass, valid, numerator
+    for channel in range(4):
+        result[:, :, channel] = operation(image[:, :, channel], 114.0 if channel < 3 else 0.0, cv2.INTER_LINEAR)
+    np.clip(result, 0.0, 255.0, out=result)
+    return result
 
 
 def resize_float_image(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:

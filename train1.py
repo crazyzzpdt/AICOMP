@@ -1,6 +1,6 @@
 """执行五通道早期融合 YOLO 训练，联合使用 RGB、红外和深度。
 
-v26对照已完成的v25：关闭新增三项亮度增强，保留FP32、batch1和1280。
+v26对照已完成的v25：关闭新增三项亮度增强，保留FP32和1280；当前物理batch为2。
 当前数据按赛事方答复恢复为官方原始标签，使用1700/300划分，不再应用历史标签清洗。
 五通道早期融合直接使用RGB、红外和深度，训练与正式预测保持同一输入协议。
 保留200轮学习率日程，允许五通道模型完整收敛，不用20轮预算提前截断。
@@ -83,7 +83,7 @@ if __name__ == "__main__":
         polish_scale=None,  # 第101轮只关Mosaic，保留v14的scale=0.3
         polish_translate=None,  # 关闭拼图后仍保留translate=0.1，与v14相同
         screening_thresholds=(),  # 本轮仅预算停止，记录budget_history.csv，不按AP硬门槛中断
-        geometry="native_square",  # 三模态五通道同步缩放、增强与114补边
+        geometry="native_square",  # 三模态同步几何；浮点协议RGB补114，IR/Depth补0
         data_audit=DATA_AUDIT,  # 使用最近一次已落位审计
         repeat_threshold=0.0,  # v17未改善总体AP95，关闭受限重复，回到v14基本采样
     ))
@@ -111,9 +111,9 @@ if __name__ == "__main__":
 
         # 二、设备、加载与资源：由用户调整，不自动试跑探测显存
         imgsz=IMAGE_HW[0],  # 保留1280，避免同时更改分辨率影响结构比较
-        batch=1,  # 保留用户v25实际批次，不增加显存压力
-        nbs=16,  # 稳态累积16批；不等同于BatchNorm物理批次16
-        workers=4,  # 每进程预取1批，关闭锁页，降低CPU内存峰值
+        batch=2,  # 用户选择的物理批次；有界跨轮检查已通过，不等于全程显存保证
+        nbs=16,  # batch=2时稳态累积8批；预热阶段由框架渐增累积次数
+        workers=2,  # 两个训练进程各预取1批；FP32验证在主进程执行，降低主机内存峰值
         device=0,  # 本机RTX 5080，不调整其他进程资源
         amp=False,  # 前向/损失/验证FP32；入口同时关闭TF32
         cache=False,  # 不新增大体积融合NPY缓存

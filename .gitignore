@@ -276,6 +276,8 @@ runs/
 /predict_*/
 /复赛predict*/
 /历史产出/
+# 复赛打包脚本输出目录（含权重与PDF），与提交产物一样本地保留不入库
+/AIC-2026-81588292-牛副队-复赛-潘炜德/
 /tools/archive/run_snapshots/
 *.cache
 # 落位后的训练数据不入库，仅保留类别配置文件

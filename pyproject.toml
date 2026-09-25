@@ -8,12 +8,14 @@ dependencies = [
     "calflops>=0.3.2",
     "faster-coco-eval>=1.8.0",
     "loguru>=0.7.3",
+    "pypandoc-binary>=1.17",
     "pyyaml>=6.0.3",
     "scipy>=1.18.1",
     "tensorboard>=2.21.0",
     "torch==2.14.0",
     "torchvision>=0.29.0",
     "transformers>=5.17.0",
+    "typst>=0.15.0",
     "ultralytics>=8.4.152",
 ]
 

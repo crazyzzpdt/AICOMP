@@ -3,7 +3,10 @@
 | 位置 | 职责 |
 |---|---|
 | `modalities.py` | 框架无关的连续浮点三模态读取、几何与传感器增强 |
+| `prediction_io.py` | 模态配对、有限预取、图片/TXT保存、ZIP和材料；不选择或加载模型 |
+| `yolo/prediction.py` | YOLO专用权重校验、预处理和预测；入口为根目录predict1.py |
 | `yolo/aic/` | YOLO模型、数据集、训练器和旧权重反序列化兼容 |
+| `dfine/prediction.py` | D-FINE专用预测及历史输入兼容；入口为根目录predict2.py |
 | `dfine/training.py` | 项目D-FINE五通道训练适配 |
 | `dfine/runtime.py` | 项目D-FINE构建、源码验证和坐标解码 |
 | `D-FINE/src/`、`D-FINE/configs/` | 上游D-FINE实现与配置；目录层级保留，避免破坏源码清单及相对配置 |

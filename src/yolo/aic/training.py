@@ -9,7 +9,6 @@ from __future__ import annotations
 # 内置库
 import csv
 import hashlib
-import io
 import json
 import logging
 import math
@@ -81,6 +80,7 @@ class MultimodalYOLODataset(YOLODataset):
     """读取同名 RGB、红外、深度图并交给 Ultralytics 检测增强流程。"""
 
     input_channels: int = 5
+    retain_buffer_images: bool = True
 
     def __init__(self, *args: object, data: dict[str, object], polish_scale: float | None = None,
                  polish_translate: float | None = None, **kwargs: object) -> None:
@@ -198,13 +198,15 @@ class MultimodalYOLODataset(YOLODataset):
                 image = self.resize_image(image, (self.imgsz, self.imgsz))
 
             if self.augment and self.cache != "ram":
-                self.ims[index] = image
-                self.im_hw0[index] = (height_original, width_original)
-                self.im_hw[index] = image.shape[:2]
-                self.buffer.append(index)
-                if 1 < len(self.buffer) >= self.max_buffer_length:
-                    old_index = self.buffer.pop(0)
-                    if self.cache != "ram":
+                if self.retain_buffer_images:
+                    self.ims[index] = image
+                    self.im_hw0[index] = (height_original, width_original)
+                    self.im_hw[index] = image.shape[:2]
+                # 浮点模式只保留同样的Mosaic候选索引；命中不刷新FIFO，保持原采样规则。
+                if index not in self.buffer:
+                    self.buffer.append(index)
+                    if 1 < len(self.buffer) >= self.max_buffer_length:
+                        old_index = self.buffer.pop(0)
                         self.ims[old_index], self.im_hw0[old_index], self.im_hw[old_index] = None, None, None
 
             return image, (height_original, width_original), image.shape[:2]
@@ -272,6 +274,8 @@ class FloatPerspective(RandomPerspective):
 
 class FloatYOLODataset(MultimodalYOLODataset):
     """新训练的连续浮点协议，不读取旧融合缓存。"""
+
+    retain_buffer_images: bool = False
 
     def __init__(self, *args: Any, sensors: SensorAugment, **kwargs: Any) -> None:
         self.sensors = sensors
@@ -570,6 +574,39 @@ class EpochDataLoader(torch.utils.data.DataLoader):
     def reset(self) -> None:
         """兼容原生训练器的关Mosaic生命周期，不立即启动预取。"""
         self.close()
+
+
+def copy_checkpoint_to_cpu(value: Any) -> Any:
+    """递归复制优化器状态至CPU，不在GPU上复制Adam动量。"""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", copy=True)
+    if isinstance(value, dict):
+        return {key: copy_checkpoint_to_cpu(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [copy_checkpoint_to_cpu(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(copy_checkpoint_to_cpu(item) for item in value)
+    return deepcopy(value)
+
+
+def copy_ema_to_cpu(model: torch.nn.Module) -> torch.nn.Module:
+    """利用deepcopy备忘录直接构建CPU模型，保持训练中的EMA设备与参数不变。"""
+    memo: dict[int, Any] = {}
+    criterion = getattr(model, "criterion", None)
+    if criterion is not None:
+        memo[id(criterion)] = None
+    # 包括检测头动态生成但未注册的anchors/strides，避免其在GPU被深拷贝。
+    for module in model.modules():
+        tensors = list(module.parameters(recurse=False)) + list(module.buffers(recurse=False))
+        tensors.extend(item for item in vars(module).values() if isinstance(item, torch.Tensor))
+        for tensor in tensors:
+            if id(tensor) not in memo:
+                copied = tensor.detach().to(device="cpu", copy=True)
+                memo[id(tensor)] = (torch.nn.Parameter(copied, requires_grad=tensor.requires_grad)
+                                    if isinstance(tensor, torch.nn.Parameter) else copied)
+    result = deepcopy(model, memo).float().to(memory_format=torch.contiguous_format)
+    result.criterion = None
+    return result
 
 
 def append_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1154,11 +1191,11 @@ class FusionDetectionTrainer(DetectionTrainer):
     def get_dataloader(
         self, dataset_path: str, batch_size: int = 16, rank: int = -1, mode: str = "train"
     ) -> InfiniteDataLoader | EpochDataLoader:
-        """为本机单卡构建低预取加载器，验证进程数不再翻倍。
+        """为本机单卡构建低预取加载器，连续浮点模式验证不另建进程池。
 
         Note:
             五通道增强曾出现 CPU 内存分配失败，因此每个进程仅预取一批，关闭锁页。
-            当前实现限定单卡训练；Windows 多进程入口仍由 main.py 保护。
+            当前实现限定单卡训练；Windows 多进程入口由 train1.py 保护。
         """
         if rank != -1:
             raise ValueError("当前三模态加载器面向本机单卡，请使用 device=0")
@@ -1171,6 +1208,9 @@ class FusionDetectionTrainer(DetectionTrainer):
         batch_size = min(batch_size, len(dataset))
         shuffle: bool = mode == "train" and not dataset.rect
         workers: int = min(self.args.workers, math.ceil(len(dataset) / batch_size))
+        if self.continuous_depth and mode == "val":
+            # FP32验证逐张在主进程读图，避免Windows再常驻一整组PyTorch子进程。
+            workers = 0
         generator = torch.Generator().manual_seed(self.args.seed)
         LOGGER.info(f"{mode}: 加载进程 {workers}，每进程预取 1 批，锁页内存关闭")
         if mode == "train" and self.recipe.repeat_threshold:
@@ -1182,7 +1222,8 @@ class FusionDetectionTrainer(DetectionTrainer):
                 pin_memory=False, collate_fn=dataset.collate_fn, worker_init_fn=seed_worker,
                 generator=generator, drop_last=False,
             )
-        return InfiniteDataLoader(
+        loader_type = EpochDataLoader if self.continuous_depth else InfiniteDataLoader
+        return loader_type(
             dataset=dataset,
             batch_size=batch_size,
             shuffle=shuffle,
@@ -1193,6 +1234,7 @@ class FusionDetectionTrainer(DetectionTrainer):
             worker_init_fn=seed_worker,
             generator=generator,
             drop_last=bool(self.args.compile and mode == "train"),
+            **({"persistent_workers": workers > 0} if self.continuous_depth else {}),
         )
 
     def build_optimizer(self, model: torch.nn.Module, name: str = "AdamW", lr: float = 0.001,
@@ -1457,25 +1499,28 @@ class FusionDetectionTrainer(DetectionTrainer):
         for model in (unwrap_model(self.model), self.ema.ema):
             model.fusion_training = deepcopy(state)
         if self.continuous_depth:
-            ema = deepcopy(self.ema.ema).float().to(memory_format=torch.contiguous_format)
-            ema.criterion = None
+            ema = copy_ema_to_cpu(self.ema.ema)
             if not all(torch.isfinite(value).all() for value in ema.state_dict().values()):
                 raise FloatingPointError("EMA含非有限参数，拒绝伪造有效检查点")
             checkpoint = {"epoch": self.epoch, "best_fitness": self.best_fitness, "model": None,
                           "ema": ema, "updates": self.ema.updates,
-                          "optimizer": deepcopy(self.optimizer.state_dict()), "scaler": self.scaler.state_dict(),
+                          "optimizer": copy_checkpoint_to_cpu(self.optimizer.state_dict()), "scaler": self.scaler.state_dict(),
                           "train_args": vars(self.args), "train_metrics": {**self.metrics, "fitness": self.fitness},
                           "train_results": self.read_results_csv(), "date": datetime.now().astimezone().isoformat(),
                           "version": ultralytics.__version__, "preprocess": FLOAT_PREPROCESS_VERSION,
                           "precision": "FP32", "license": "AGPL-3.0"}
-            buffer = io.BytesIO()
-            torch.save(checkpoint, buffer)
             self.wdir.mkdir(parents=True, exist_ok=True)
-            self.last.write_bytes(buffer.getvalue())
+            # 流式写临时文件再替换，省去整个BytesIO副本；失败时保留上一轮last。
+            temporary = self.last.with_suffix(".pt.tmp")
+            try:
+                torch.save(checkpoint, temporary)
+                temporary.replace(self.last)
+            finally:
+                temporary.unlink(missing_ok=True)
             if self.best_fitness == self.fitness:
-                self.best.write_bytes(buffer.getvalue())
+                shutil.copy2(self.last, self.best)
             if self.save_period > 0 and (self.epoch + 1) % self.save_period == 0:
-                (self.wdir / f"epoch{self.epoch + 1}.pt").write_bytes(buffer.getvalue())
+                shutil.copy2(self.last, self.wdir / f"epoch{self.epoch + 1}.pt")
             result = True
         else:
             result = super().save_model()
@@ -1496,7 +1541,12 @@ class FusionDetectionTrainer(DetectionTrainer):
                 with redirect_stdout(LogStream(sys.stdout, log)), redirect_stderr(LogStream(sys.stderr, log)):
                     super().train()
         finally:
-            if isinstance(getattr(self, "train_loader", None), EpochDataLoader):
-                self.train_loader.close()
+            for name in ("train_loader", "test_loader"):
+                loader = getattr(self, name, None)
+                if isinstance(loader, (EpochDataLoader, InfiniteDataLoader)):
+                    try:
+                        loader.close()
+                    except Exception as error:
+                        LOGGER.warning(f"关闭{name}时发生异常：{error}")
             LOGGER.removeHandler(handler)
             handler.close()
