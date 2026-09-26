@@ -168,7 +168,7 @@ def image_tensor(image: np.ndarray) -> torch.Tensor:
 
 
 class MultimodalDFineDataset(Dataset):
-    """直接读取 datasets 的现有划分，标签只读，不复制或重建训练数据。"""
+    """只读现有划分，内存中统一训练与验证的原图边界裁框，不写回标签。"""
 
     def __init__(self, data_path: Path, split: str, config: TrainingConfig) -> None:
         self.config = config
@@ -189,6 +189,8 @@ class MultimodalDFineDataset(Dataset):
             raise ValueError(f"{split} 图像为空或与标签未一一对应")
         self.labels: list[np.ndarray] = []
         self.sizes: list[tuple[int, int]] = []
+        self.clipped_images: int = 0
+        self.clipped_boxes: int = 0
         annotations: list[dict[str, object]] = []
         image_records: list[dict[str, object]] = []
         signature = hashlib.sha256()
@@ -209,20 +211,32 @@ class MultimodalDFineDataset(Dataset):
             with Image.open(path) as opened:
                 width, height = opened.size
             self.sizes.append((width, height))
-            self.labels.append(labels)
             image_records.append({"id": index, "file_name": path.name, "width": width, "height": height})
-            for category, cx, cy, bw, bh in labels:
-                x1, y1, x2, y2 = cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2
-                if min(x1, y1) < -1e-4 or max(x2, y2) > 1.0001:
-                    raise ValueError(f"标签越界，请人工复核而非训练时静默清洗：{path.stem}")
-                left, top = max(0.0, float(x1)) * width, max(0.0, float(y1)) * height
-                box_width = min(1.0, float(x2)) * width - left
-                box_height = min(1.0, float(y2)) * height - top
+            clipped_in_image: int = 0
+            for box_index, row in enumerate(labels):
+                category, cx, cy, bw, bh = (float(value) for value in row)
+                original_box = (cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2)
+                x1, y1 = max(0.0, original_box[0]), max(0.0, original_box[1])
+                x2, y2 = min(1.0, original_box[2]), min(1.0, original_box[3])
+                if x2 <= x1 or y2 <= y1:
+                    raise ValueError(f"标签框与原图无有效交集：{path.stem}，第 {box_index + 1} 个框；请核对原始标注")
+                # 官方标签中存在部分越界的贴边框；仅处理内存副本，原文及其审计摘要保持不变。
+                # 训练目标与COCO标注共用此处的原图交集，避免一边用原框、一边用裁后框。
+                if original_box != (x1, y1, x2, y2):
+                    labels[box_index, 1:] = ((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1)
+                    clipped_in_image += 1
+                left, top = x1 * width, y1 * height
+                box_width = (x2 - x1) * width
+                box_height = (y2 - y1) * height
                 annotations.append({"id": len(annotations) + 1, "image_id": index, "category_id": int(category),
                                     "bbox": [left, top, box_width, box_height], "area": box_width * box_height, "iscrowd": 0})
+            self.labels.append(labels)
+            self.clipped_images += int(clipped_in_image > 0)
+            self.clipped_boxes += clipped_in_image
         self.signature: str = signature.hexdigest()
         self.coco_data: dict[str, object] = {"info": {}, "images": image_records, "annotations": annotations,
                                            "categories": [{"id": i, "name": name} for i, name in enumerate(CLASS_NAMES)]}
+        print(f"{split} 标签边界处理：{self.clipped_images} 张图、{self.clipped_boxes} 个框在内存中裁至原图边界；标签文件未修改，目标未删除")
 
     def __len__(self) -> int:
         return len(self.images)
@@ -511,6 +525,12 @@ def run_training(config: TrainingConfig, output: Path) -> None:
               "dataset_signatures": [training.signature, validation.signature]}
     recipe["data_audit_sha256"] = audit_hash
     recipe["adapter_sha256"] = adapter_hashes
+    recipe["label_geometry"] = {
+        "policy": "clip_to_image_bounds_v1", "source_files_modified": False,
+        "degenerate_boxes": "error",
+        "clipped": {split: {"images": dataset.clipped_images, "boxes": dataset.clipped_boxes}
+                    for split, dataset in (("train", training), ("val", validation))},
+    }
     recipe["loss_weights"] = dict(criterion.weight_dict)
     recipe["precision"] = "FP32_no_autocast_no_tf32"
     recipe["sampling"] = {"enabled": False, "samples_per_epoch": epoch_samples}
