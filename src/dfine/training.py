@@ -1,4 +1,4 @@
-"""将官方 D-FINE-L 接入本地 RGB、红外、深度五通道训练与预测。
+"""将官方D-FINE-L/X接入本地RGB、红外、深度五通道训练与预测。
 
 由 train2.py 启动；仅支持新浮点协议训练，旧权重推理由predict2.py保留。
 不联网下载、不改写数据集，不运行独立评估；验证仅发生在用户启动的训练轮末。
@@ -60,7 +60,7 @@ OBJECTS365_ROWS: dict[str, tuple[int, str] | None] = {
 # 与官方预训练一致采用 0–1 输入，不额外套用 ImageNet 均值和标准差。
 PREPROCESS_VERSION: str = FLOAT_PREPROCESS_VERSION
 # 区分本项目检查点与 Ultralytics 序列化模型，拒绝误加载 RGB 官方原权重。
-CHECKPOINT_FORMAT: str = "aic_dfine_l_5ch_v1"
+CHECKPOINT_FORMAT: str = "aic_dfine_5ch_v2"
 
 
 @dataclass(frozen=True)
@@ -108,6 +108,7 @@ class TrainingConfig:
     min_delta: float = 0.0005
     domain_metrics: bool = True
     data_audit: str | None = None
+    variant: str = "l"  # 写入检查点，预测按此选择真实L/X结构；历史缺省为L
 
 
 def transfer_pretrained(model: nn.Module, weights: Path) -> dict[str, object]:
@@ -407,6 +408,8 @@ def plot_results(path: Path) -> None:
 
 def train(config: TrainingConfig) -> None:
     """创建独立运行目录并执行固定预算微调；只能由 train2.py 显式调用。"""
+    if config.variant not in {"l", "x"}:
+        raise ValueError("variant必须显式选择l或x")
     if config.imgsz < 32 or config.imgsz % 32 or min(config.batch, config.val_batch, config.effective_batch) < 1 or config.effective_batch % config.batch:
         raise ValueError("imgsz 必须为 32 的倍数；effective_batch 必须为 batch 的正整数倍")
     if config.epochs <= config.warmup_epochs or config.warmup_epochs < 0 or not 0 < config.scale_min <= 1 or not 0 <= config.polish_epoch < config.epochs:
@@ -486,7 +489,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
                     digest = hashlib.file_digest(handle, "sha256").hexdigest()
                 if digest != sample.get("source_hashes", {}).get(modality):
                     raise ValueError(f"三模态来源与清洗审计不符：{path.name}/{modality}")
-    model, criterion = build_model(config.imgsz, training=True)
+    model, criterion = build_model(config.imgsz, training=True, variant=config.variant)
     if criterion is None:
         raise RuntimeError("未创建官方 D-FINE 损失函数")
     criterion.weight_dict.update({"loss_vfl": config.loss_vfl, "loss_bbox": config.loss_bbox,
@@ -555,7 +558,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
         target = snapshot / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT_ROOT / filename, target)
-    print(f"D-FINE-L 五通道训练：{len(training)} train / {len(validation)} val，{config.imgsz}px，{start_epoch + 1}–{config.epochs} 轮")
+    print(f"D-FINE-{config.variant.upper()} 五通道训练：{len(training)} train / {len(validation)} val，{config.imgsz}px，{start_epoch + 1}–{config.epochs} 轮")
     print(f"迁移记录：{transfer}\n结果目录：{output}\nFP32 前向、损失与EMA；物理批次 {config.batch}，有效批次 {config.effective_batch}")
     accumulate = config.effective_batch // config.batch
     started = time.monotonic()

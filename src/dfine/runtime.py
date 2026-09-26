@@ -42,8 +42,8 @@ def check_source() -> Path:
     return source
 
 
-def build_model(imgsz: int, training: bool = False) -> tuple[nn.Module, nn.Module | None]:
-    """构建不联网的 12 类五通道 D-FINE-L，输入端不冻结。
+def build_model(imgsz: int, training: bool = False, variant: str = "l") -> tuple[nn.Module, nn.Module | None]:
+    """构建不联网的12类五通道D-FINE-L/X，输入端不冻结。
 
     Args:
         imgsz: 正方形填充尺寸，必须为 32 的倍数。
@@ -52,6 +52,8 @@ def build_model(imgsz: int, training: bool = False) -> tuple[nn.Module, nn.Modul
     Returns:
         五通道模型，以及训练时使用的损失函数。
     """
+    if variant not in {"l", "x"}:
+        raise ValueError("D-FINE规模仅支持l或x，不能按文件名静默猜测")
     source = check_source()
     from src.core import YAMLConfig
     import src.nn  # noqa: F401
@@ -59,10 +61,12 @@ def build_model(imgsz: int, training: bool = False) -> tuple[nn.Module, nn.Modul
     import src.optim  # noqa: F401
 
     config = YAMLConfig(
-        str(source / "configs/dfine/include/dfine_hgnetv2.yml"),
+        str(source / ("configs/dfine/dfine_hgnetv2_x_coco.yml" if variant == "x"
+                      else "configs/dfine/include/dfine_hgnetv2.yml")),
         num_classes=len(CLASS_NAMES), remap_mscoco_category=False,
         eval_spatial_size=[imgsz, imgsz], num_top_queries=100,
-        HGNetv2={"name": "B4", "pretrained": False, "freeze_at": -1, "freeze_norm": True},
+        HGNetv2={"name": "B5" if variant == "x" else "B4", "pretrained": False,
+                 "freeze_at": -1, "freeze_norm": True},
     )
     model = config.model
     original = model.backbone.stem.stem1.conv

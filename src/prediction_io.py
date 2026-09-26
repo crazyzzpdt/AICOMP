@@ -5,16 +5,12 @@ import argparse
 import hashlib
 import json
 import os
-import re
-import shutil
-import sys
 import time
 from collections import Counter, deque
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
-from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -32,6 +28,7 @@ import ultralytics
 from ultralytics.engine.results import Results
 
 from src.modalities import CLASS_NAMES, IMAGE_SUFFIXES, configure_fp32
+from tools.IntegrateAndPackage import TEAM_ID, PackageConfig, package as integrate_round2_package
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
 MAX_DETECTIONS: int = 100
@@ -66,14 +63,7 @@ class OutputConfig:
     show_boxes: bool = True
     line_width: int | None = None
     verbose: bool = True
-    phase: str = "round2"
-    export_materials: bool = True
-    materials_only: bool = False
-    team_id: str = ""
-    team_name: str = ""
-    captain: str = ""
-    weights_url: str = ""
-    technical_report: Path | None = None
+    report: Path = Path("docs/技术方案.md")
 
 
 @dataclass
@@ -148,7 +138,7 @@ def prepare_output(output: Path) -> None:
     if output.exists():
         raise FileExistsError(f"输出目录已存在，不会覆盖：{output}；请用 --output 指定新目录")
     output.mkdir(parents=True, exist_ok=False)
-    for name in ("images", "labels", "比赛提交内容"):
+    for name in ("images", "labels"):
         (output / name).mkdir()
 
 
@@ -254,7 +244,7 @@ def build_submission(output: Path, image_names: list[str], save_images: bool = T
         打包中断仅留下 submission.zip.partial，不会留下冒充完整提交的 ZIP。
         Windows rename 不覆盖已有文件，符合本项目的防覆盖要求。
     """
-    archive: Path = output / "比赛提交内容" / "submission.zip"
+    archive: Path = output / "submission.zip"
     if archive.exists():
         raise FileExistsError(f"提交包已存在，拒绝覆盖：{archive}")
     expected: set[str] = {f"{Path(name).stem}.txt" for name in image_names}
@@ -289,6 +279,8 @@ def prediction_source_hashes(source_paths: tuple[str, ...]) -> dict[str, str]:
     paths: dict[str, Path] = {}
     for name in source_paths:
         source = PROJECT_ROOT / name
+        if not source.exists():
+            raise FileNotFoundError(f"预测源码缺失：{source}")
         candidates = sorted(source.rglob("*")) if source.is_dir() else [source]
         for path in candidates:
             if path.is_file() and path.suffix in {".py", ".yaml", ".yml", ".json"}:
@@ -304,175 +296,26 @@ def prediction_source_hashes(source_paths: tuple[str, ...]) -> dict[str, str]:
     return hashes
 
 
-def export_round2_materials(config: OutputConfig, metadata: dict[str, object], archive: Path, source_paths: tuple[str, ...], entrypoint: str) -> Path:
-    """分离导出模型和源码，并如实列出未备齐或未验证的复赛材料。
-
-    Note:
-        不复制赛事图像、标签、虚拟环境、Git或整个runs目录。训练源码取所选
-        权重运行的code快照，不以当前入口冒充历史模型训练代码。
-        本函数不运行模型、不上传网盘，也不把文件齐全等同于评审环境复现通过。
-    """
-    if metadata.get("source_hashes") != prediction_source_hashes(source_paths):
-        raise ValueError("预测源码已变化或原记录缺少源码摘要；请恢复原源码后补材料，不能伪称代码与结果一致")
-
-    def copy_file(source: Path, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with source.open("rb") as reader, target.open("xb") as writer:
-            shutil.copyfileobj(reader, writer)
-
-    def copy_sources(source: Path, target: Path) -> int:
-        count = 0
-        for path in sorted(source.rglob("*")):
-            relative = path.relative_to(source)
-            if path.is_symlink() or any(part in {".git", "__pycache__", ".venv"} for part in relative.parts):
-                continue
-            if path.is_file() and (path.suffix.lower() in {".py", ".yaml", ".yml", ".json", ".toml", ".md", ".txt"}
-                                  or path.name in {"LICENSE", "NOTICE"}):
-                copy_file(path, target / relative)
-                count += 1
-        return count
-
-    pending: list[str] = []
-    identity = (config.team_id, config.team_name, config.captain)
-    complete_identity = all(identity)
-    if not complete_identity:
-        pending.append("补充参赛团队编号、团队名称、队长姓名，并按附件2命名根目录")
-    team_id = config.team_id or "待填团队编号"
-    root_name = "-".join((config.team_id, config.team_name, "复赛", config.captain)) if complete_identity else "复赛材料待补队伍信息"
-    # 每次仅打包也另建容器；不覆写上一次已核对的材料。
-    container = config.output / "比赛提交内容" / f"审阅材料_{datetime.now():%Y%m%d_%H%M%S_%f}"
-    root = container / root_name
-    root.mkdir(parents=True, exist_ok=False)
-    code = root / f"{team_id}-代码与数据"
-    model_dir = root / f"{team_id}-模型文件"
-    code.mkdir()
-    model_dir.mkdir()
-    copy_file(config.weights, model_dir / config.weights.name)
-    with (model_dir / config.weights.name).open("rb") as handle:
-        if hashlib.file_digest(handle, "sha256").hexdigest() != metadata["weights_sha256"]:
-            raise ValueError("导出的模型与预测使用的模型摘要不一致，材料未完成")
-    copy_file(archive, root / "submission.zip")
-    copy_file(config.output / "prediction.json", root / "prediction.json")
-    for name in source_paths:
-        source = PROJECT_ROOT / name
-        if source.is_dir():
-            copy_sources(source, code / name)
-        else:
-            copy_file(source, code / name)
-    copy_sources(PROJECT_ROOT / "docs", code / "docs")
-    for name in ("pyproject.toml", "uv.lock"):
-        if (PROJECT_ROOT / name).is_file():
-            copy_file(PROJECT_ROOT / name, code / name)
-    # 当前安装包含项目所需YOLO接口，不能仅写一个pip版本号就声称源码一致。
-    copy_sources(Path(ultralytics.__file__).parent, code / "ultralytics")
+def build_round2_package(config: OutputConfig, submission: Path) -> Path:
+    """调用tools中的官方复赛整合工具，并在成功后移除临时排行榜ZIP。"""
     run = config.weights.parent.parent
-    snapshot = run / "code"
-    archived_run = (PROJECT_ROOT / "tools" / "archive" / "run_snapshots" / run.relative_to(PROJECT_ROOT / "runs")
-                    if run.is_relative_to(PROJECT_ROOT / "runs") else run)
-    archived_snapshot = archived_run / "code"
-    if not snapshot.is_dir() and archived_snapshot.is_dir():
-        snapshot = archived_snapshot
-    if (snapshot / "train1.py").is_file() or (snapshot / "train2.py").is_file():
-        copy_sources(snapshot, code / "训练源码")
-    elif (run / "train1.py").is_file() or (run / "main.py").is_file() or (archived_run / "train1.py").is_file() or (archived_run / "main.py").is_file():
-        # v4/v5将源码直接留在运行根目录，只复制同层Python，不递归带入图像和权重。
-        source_run = run if list(run.glob("*.py")) else archived_run
-        for path in sorted(source_run.glob("*.py")):
-            if not path.is_symlink():
-                copy_file(path, code / "训练源码" / path.name)
-        pending.append("已导出旧运行根目录Python快照；需按其导入核对依赖完整性和当时框架版本")
-    else:
-        pending.append("所选模型缺少训练入口快照：从该版本Git恢复真实训练源码，不能使用当前入口替代")
-    for name in ("args.yaml", "optimization_recipe.json"):
-        if (run / name).is_file():
-            copy_file(run / name, code / "训练记录" / name)
-    packages = ("torch", "torchvision", "ultralytics", "numpy", "opencv-python", "pillow", "PyYAML",
-                "scipy", "matplotlib", "tqdm", "psutil", "requests", "polars", "ultralytics-thop",
-                "faster-coco-eval")
-    if entrypoint == "predict2.py":
-        packages += ("loguru", "tensorboard", "transformers", "calflops")
-    dependencies: list[str] = []
-    for package in packages:
-        try:
-            dependencies.append(f"{package}=={version(package)}")
-        except PackageNotFoundError:
-            pending.append(f"未发现{package}的安装元数据，需核对依赖")
-    (code / "requirements.txt").write_text("\n".join(dependencies) + "\n", encoding="utf-8")
-    if config.technical_report is not None:
-        copy_file(config.technical_report, root / f"{team_id}-技术方案.PDF")
-    else:
-        template = PROJECT_ROOT / "docs" / "技术方案.md"
-        draft = template.read_text(encoding="utf-8") if template.is_file() else "# 复赛技术方案（待定稿）\n"
-        # 报告位于材料根目录，关联知识文档位于代码目录，不留下迁移后的断链。
-        draft = re.sub(r'\]\(([^():\n]+\.md(?:#[^()\n]*)?)\)',
-                       lambda match: f']({team_id}-代码与数据/docs/{match.group(1)})', draft)
-        actual = {key: metadata.get(key) for key in ("run", "weights", "weights_sha256", "phase", "images", "backend",
-                  "architecture", "fusion_version", "imgsz", "height", "conf", "iou", "max_det", "preprocess")}
-        draft += "\n\n## 本次实际提交候选（自动记录）\n\n```json\n" + json.dumps(actual, ensure_ascii=False, indent=2) + "\n```\n"
-        (root / f"{team_id}-技术方案.md").write_text(draft, encoding="utf-8")
-        pending.append("已按用户要求提供技术方案Markdown草稿，待核对实际提交模型并定稿转PDF；MD不是PDF替代证明")
-    if not config.weights_url:
-        pending.append("补充仅供赛事评审访问的模型权重下载链接，不使用GitHub公开存储")
-    pending.append("在评审目标环境按说明复现；当前仅打包，未验证依赖安装或训练/推理可运行性")
-    pending.append("训练复现须另行准备官方数据、既有清洗清单/审计及该版本初始化权重；不随代码复制大文件")
-    height = metadata.get("height", metadata["imgsz"])
-    iou = metadata.get("iou")
-    iou = 0.7 if iou is None else iou
-    command = (f'python {entrypoint} --weights "../{team_id}-模型文件/{config.weights.name}" '
-               f'--source "官方复赛测试集路径" --output predict_review --phase round2 '
-               f'--imgsz {metadata["imgsz"]} --height {height} --batch {metadata["batch"]} '
-               f'--conf {metadata["conf"]} --device {metadata["device"]} '
-               f'--max-det {metadata["max_det"]} --expected-count {metadata["images"]} '
-               f'--no-export-materials')
-    if entrypoint == "predict1.py":
-        command += (f' --iou {iou} --yolo-profile {metadata.get("yolo_profile") or "v4"}'
-                    f' {"--rect" if metadata["rect"] else "--no-rect"}'
-                    f' {"--multi-label" if metadata.get("multi_label") else "--no-multi-label"}')
-        for key in ("agnostic_nms", "channels_last", "stream"):
-            command += f' --{"" if metadata.get(key) else "no-"}{key.replace("_", "-")}'
-        if metadata.get("classes_filter") is not None:
-            command += " --classes " + " ".join(map(str, metadata["classes_filter"]))
-    description = ("# 复赛项目说明\n\n"
-        "本项目使用可见光、红外和深度图进行12类目标检测。仅单模型预测，不做投票集成。\n\n"
-        f"模型运行：`{metadata['run']}`；SHA256：`{metadata['weights_sha256']}`。\n\n"
-        f"权重下载链接：{config.weights_url or '待补（权重已单独放在模型文件目录）'}。\n\n"
-        "## 环境与运行\n\n"
-        f"生成环境Python={sys.version.split()[0]}，PyTorch={metadata['torch']}；GPU/CUDA平台须匹配。\n"
-        "按requirements.txt准备依赖；PyTorch CUDA轮子来源见pyproject.toml，不能以CPU版本冒充。\n"
-        "ultralytics/是本次预测实际使用的源码副本，优先于普通pip包；不含虚拟环境。\n"
-        "先在联网准备环境阶段安装依赖，正式推理离线运行，不自动下载权重或依赖。\n\n"
-        f"在本目录执行复现预测命令（替换官方测试集路径）：\n\n```powershell\n{command}\n```\n\n"
-        "## 文件与训练复现\n\n"
-        f"{entrypoint}是本模型的预测入口；src/保存对应框架实现和共用输出处理。\n"
-        "训练源码/为所选模型的运行快照（如有），训练记录/为其实际配置；不要使用当前入口替代。\n"
-        "训练前按原配置准备官方数据、既有审计与官方初始化权重，并在训练源码目录执行该版本真实训练入口；"
-        "路径和源码指纹须按该快照处理，具体缺项见材料清单。代码与数据目录名沿用附件，实际不含数据。\n\n"
-        "训练运行时须将本代码根目录加入PYTHONPATH，使自定义ultralytics源码可见；"
-        "当前预测框架副本不自动等同于历史训练框架，须核对该模型原记录。docs/保留技术依据与历史适用范围。\n\n"
-        "## 提交与注意事项\n\n"
-        "根目录submission.zip与排行榜提交结果相同，只含同名六列TXT；空检测也有空TXT。\n"
-        "模型文件与代码分开放置；大数据/环境不入代码目录。测试集不用于训练、标注或人工改结果。\n"
-        "仅通过报名系统指定渠道向评审分享材料，不能把赛事数据、权重包上传公开GitHub。\n"
-        "本材料包未经目标机器复现验证，不能据文件存在宣称训练复现成功。\n")
-    (code / "README.md").write_text(description, encoding="utf-8")
-    manifest = {"phase": "round2", "status": "needs_review", "pending": pending,
-                "weights_sha256": metadata["weights_sha256"], "inference_verified_on_reviewer_machine": False,
-                "files": []}
-    for path in sorted(root.rglob("*")):
-        if path.is_file():
-            with path.open("rb") as handle:
-                manifest["files"].append({"path": path.relative_to(root).as_posix(),
-                                          "sha256": hashlib.file_digest(handle, "sha256").hexdigest()})
-    (root / "材料清单.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    (root / "待完善.md").write_text("# 复赛材料待核对\n\n" + "\n".join(f"- {item}" for item in pending) + "\n", encoding="utf-8")
-    print(f"复赛审阅材料已导出：{root}\n尚有{len(pending)}项需核对，见待完善.md；未上传、未宣称完整交付。")
-    return root
+    package = integrate_round2_package(PackageConfig(
+        package_dir=config.output,
+        model=config.weights,
+        submission=submission,
+        run=run,
+        report=(PROJECT_ROOT / config.report).resolve(),
+    ))
+    if not package.is_dir():
+        raise RuntimeError(f"复赛整合工具没有生成预期目录：{package}")
+    submission.unlink()
+    return package
 
 
 def parse_arguments(config: OutputConfig, argv: list[str]) -> OutputConfig:
     """仅覆盖显式提供的参数；命令行名称与入口字段一一对应。"""
     parser = argparse.ArgumentParser(description="三模态预测，默认值见对应入口", argument_default=argparse.SUPPRESS)
-    paths = {"weights", "source", "output", "project", "technical_report", "data"}
+    paths = {"weights", "source", "output", "project", "report", "data"}
     integers = {"imgsz", "height", "batch", "workers", "save_workers", "prefetch_batches", "expected_count",
                 "max_det", "png_compression", "log_every", "vid_stride", "line_width", "quantize"}
     floats = {"conf", "iou", "visual_conf"}
@@ -492,30 +335,18 @@ def parse_arguments(config: OutputConfig, argv: list[str]) -> OutputConfig:
 
 
 def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str, ...], entrypoint: str) -> None:
-    """并行读取、批量推理、后台保存，全部完成后生成提交 ZIP。
+    """并行预测后调用tools复赛工具，最终只保留三个结果文件夹。
 
     Args:
         config: 入口文件中显式设置的预测参数。
         create_backend: 对应框架的加载函数，返回读图、前向函数及真实执行记录。
-        source_paths: 该入口参与摘要校验与材料导出的源码路径。
-        entrypoint: 本次入口文件名，用于生成复现命令。
+        source_paths: 该入口参与摘要记录的源码路径。
+        entrypoint: 本次入口文件名，写入预测记录。
 
     Note:
         GPU 只在主线程执行。后台保存仅持有 CPU 结果，异常会阻止生成正式 ZIP。
         不自动试跑探测显存，不重训，不修改数据或覆盖旧输出。
     """
-    if config.phase not in {"round1", "round2"}:
-        raise ValueError("phase必须是round1或round2")
-    for value in (config.team_id, config.team_name, config.captain):
-        if value and (re.search(r'[<>:"/\\|?*\x00-\x1f]', value) or value.strip() != value or
-                      value.endswith(".") or value in {".", ".."}):
-            raise ValueError("队伍信息不能含路径分隔符、首尾空格或Windows非法文件名字符")
-    if config.technical_report is not None:
-        report = (PROJECT_ROOT / config.technical_report).resolve(strict=True)
-        with report.open("rb") as handle:
-            if report.suffix.lower() != ".pdf" or handle.read(5) != b"%PDF-":
-                raise ValueError("技术方案须为真实PDF文件，不把Markdown改后缀当作PDF")
-        config = replace(config, technical_report=report)
     if config.imgsz <= 0 or config.imgsz % 32:
         raise ValueError("imgsz 必须为 32 的正整数倍")
     if min(config.batch, config.workers, config.save_workers, config.prefetch_batches, config.expected_count, config.log_every) <= 0:
@@ -537,7 +368,7 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
     if config.line_width is not None and config.line_width <= 0:
         raise ValueError("line_width须为正整数或None")
     weights, source, output = ((PROJECT_ROOT / path).resolve() for path in (config.weights, config.source, config.output))
-    if output.exists() and not config.materials_only:
+    if output.exists():
         raise FileExistsError(f"输出目录已存在，不会覆盖：{output}；请用 --output 指定新目录")
     if not weights.is_file() or weights.suffix.lower() not in {".pt", ".pth"}:
         raise FileNotFoundError(f"请指定已有的本地 .pt/.pth 五通道检测权重：{weights}")
@@ -548,18 +379,6 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
         raise ValueError(f"测试集应有 {config.expected_count} 组，实际找到 {len(samples)} 组；请检查 --source")
     with weights.open("rb") as handle:
         weight_hash: str = hashlib.file_digest(handle, "sha256").hexdigest()
-    if config.materials_only:
-        metadata = json.loads((output / "prediction.json").read_text(encoding="utf-8"))
-        archive = output / "比赛提交内容" / "submission.zip"
-        if (config.phase != "round2" or metadata.get("phase") != "round2" or
-                metadata.get("weights_sha256") != weight_hash or metadata.get("images") != len(samples) or
-                metadata.get("source") != source.name):
-            raise ValueError("仅补材料要求原复赛记录、同一权重与测试集；不能把初赛结果重新标成复赛")
-        with archive.open("rb") as handle:
-            if hashlib.file_digest(handle, "sha256").hexdigest() != metadata.get("submission_sha256"):
-                raise ValueError("排行榜结果包已改变或缺少摘要，拒绝与其他模型材料混用")
-        export_round2_materials(replace(config, weights=weights, source=source, output=output), metadata, archive, source_paths, entrypoint)
-        return
     configure_fp32()
     config = replace(config, weights=weights, source=source, output=output)
     source_hashes = prediction_source_hashes(source_paths)
@@ -611,7 +430,7 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
     elapsed = time.perf_counter() - started
     metadata: dict[str, object] = {
         "created_at": datetime.now().astimezone().isoformat(), "entrypoint": entrypoint,
-        "weights": weights.name, "phase": config.phase, "source_hashes": source_hashes,
+        "weights": weights.name, "phase": "round2", "source_hashes": source_hashes,
         "run": weights.parent.parent.name, "weights_sha256": weight_hash, "source": source.name,
         "images": len(samples), "classes": list(CLASS_NAMES), "ultralytics": ultralytics.__version__,
         "torch": torch.__version__, "imgsz": config.imgsz, "height": config.height,
@@ -629,9 +448,14 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
     archive = build_submission(output, [sample[0].name for sample in samples], config.save)
     with archive.open("rb") as handle:
         metadata["submission_sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
-    with (output / "prediction.json").open("x", encoding="utf-8") as handle:
-        json.dump(metadata, handle, ensure_ascii=False, indent=2)
     print(f"读取、推理、绘图与保存共 {elapsed:.1f} 秒，平均 {len(samples) / elapsed:.2f} 组/秒（不含模型加载与 ZIP 打包）")
-    print(f"排行榜结果包校验通过，共 {len(samples)} 个TXT：{archive}\n只将此ZIP上传结果入口，代码/权重不混入TXT包。")
-    if config.phase == "round2" and config.export_materials:
-        export_round2_materials(config, metadata, archive, source_paths, entrypoint)
+    package = build_round2_package(config, archive)
+    record = package / f"{TEAM_ID}-代码与数据" / "prediction.json"
+    with record.open("x", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    expected = {"images", "labels", package.name}
+    actual = {path.name for path in output.iterdir()}
+    if actual != expected:
+        raise RuntimeError(f"预测输出结构不符合约定：期望{sorted(expected)}，实际{sorted(actual)}")
+    print(f"预测及复赛材料已完成：{output}")
+    print(f"结果根目录只含 images、labels 和 {package.name}；submission.zip 位于团队文件夹的代码与数据目录。")

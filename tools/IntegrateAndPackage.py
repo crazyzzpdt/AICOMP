@@ -95,11 +95,14 @@ def copy_source_files(source: Path, target: Path) -> int:
     return count
 
 
-def package(config: PackageConfig) -> None:
+def package(config: PackageConfig) -> Path:
     """在打包位置重建附件2目录，复制代码与数据，并按需生成技术方案PDF。
 
     Args:
         config: 已解析的命令行参数。
+
+    Returns:
+        已生成的固定团队目录绝对路径。
 
     Raises:
         FileNotFoundError: 打包位置、模型权重、运行目录或待打包源文件缺失。
@@ -197,6 +200,7 @@ def package(config: PackageConfig) -> None:
         print(f"复赛提交包已整合：{root}")
         for item in pending:
             print(f"提示：{item}")
+        return root
     finally:
         if pdf_temporary is not None and pdf_temporary.exists():
             pdf_temporary.unlink()
