@@ -23,7 +23,7 @@ from src.yolo.aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSIO
     letterbox_native_quality, restore_boxes, single_label_nms)
 
 SOURCE_PATHS = ("predict1.py", "src/__init__.py", "src/prediction_io.py", "src/modalities.py",
-                "src/yolo", "tools/__init__.py", "tools/prepare_dataset.py")
+                "src/yolo", "tools/__init__.py", "tools/IntegrateAndPackage.py", "tools/md2pdf")
 
 
 @dataclass(frozen=True)

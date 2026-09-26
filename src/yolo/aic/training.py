@@ -427,6 +427,7 @@ class FusionRecipe:
     # 与epochs学习率日程解耦；None保持历史行为，预算结束仍保存当轮完整产物。
     budget_epochs: int | None = None
     continuous_depth: bool = False
+    freeze_bn_stats: bool = False  # 小批次可固定预训练BN统计；仿射参数仍参与优化
     sensors: SensorAugment = SensorAugment()
 
 
@@ -748,8 +749,13 @@ class RectangularValidator(DetectionValidator):
     """使用FP32单标签NMS，兼容原生矩形与历史固定矩形画布。"""
 
     clip_content: bool = True
+    validation_probe: dict[str, Any] | None = None
+    validation_probe_written: bool = False
 
     def __call__(self, trainer: Any = None, model: Any = None, **kwargs: Any) -> dict[str, float]:
+        # 每轮只记录原有验证的首批张量，定位输入/输出/筛框异常，不增加模型前向。
+        self.validation_probe: dict[str, Any] | None = None
+        self.validation_probe_written = False
         if trainer is None:
             if self.dataloader is None or not isinstance(self.dataloader.dataset, MultimodalYOLODataset):
                 raise ValueError("独立本地验证须显式提供三模态验证加载器，不自动读取官方测试集")
@@ -769,8 +775,39 @@ class RectangularValidator(DetectionValidator):
         super().init_metrics(model)
         self.domains: list[str] = []
 
+    def preprocess(self, batch: dict[str, Any]) -> dict[str, Any]:
+        """记录归一化后首批五通道范围，不修改父类输入计算。"""
+        batch = super().preprocess(batch)
+        if not self.validation_probe_written and self.validation_probe is None:
+            image = batch["img"].detach()
+            self.validation_probe = {
+                "epoch": self.epoch, "images": [str(path) for path in batch["im_file"]],
+                "shape": list(image.shape), "dtype": str(image.dtype),
+                "input_finite": bool(torch.isfinite(image).all()),
+                "channel_min": image.amin(dim=(0, 2, 3)).cpu().tolist(),
+                "channel_max": image.amax(dim=(0, 2, 3)).cpu().tolist(),
+            }
+        return batch
+
     def postprocess(self, preds: Any) -> list[dict[str, torch.Tensor]]:
+        if self.validation_probe is not None and not self.validation_probe_written:
+            decoded = preds[0] if isinstance(preds, (tuple, list)) else preds
+            if isinstance(decoded, torch.Tensor):
+                self.validation_probe["decoded_shape"] = list(decoded.shape)
+                self.validation_probe["decoded_finite"] = bool(torch.isfinite(decoded).all())
+                if decoded.ndim == 3 and decoded.shape[1] == 16:
+                    scores = decoded[:, 4:].detach()
+                    boxes = decoded[:, :4].detach()
+                    self.validation_probe.update({
+                        "score_max": float(scores.max()),
+                        "class_score_max": scores.amax(dim=(0, 2)).cpu().tolist(),
+                        "candidates_above_conf": (scores.amax(dim=1) >= self.args.conf).sum(dim=1).cpu().tolist(),
+                        "box_min": boxes.amin(dim=(0, 2)).cpu().tolist(),
+                        "box_max": boxes.amax(dim=(0, 2)).cpu().tolist(),
+                    })
         rows = single_label_nms(preds, self.args.conf, self.args.iou, self.args.max_det)
+        if self.validation_probe is not None and not self.validation_probe_written:
+            self.validation_probe["after_nms"] = [len(row) for row in rows]
         return [{"bboxes": row[:, :4], "conf": row[:, 4], "cls": row[:, 5], "extra": row[:, 6:]} for row in rows]
 
     def update_metrics(self, preds: list[dict], batch: dict) -> None:
@@ -782,6 +819,14 @@ class RectangularValidator(DetectionValidator):
             for key in prediction:
                 prediction[key] = prediction[key][keep]
             prediction["bboxes"] = boxes
+        if self.validation_probe is not None and not self.validation_probe_written:
+            self.validation_probe["after_content_clip"] = [len(prediction["bboxes"]) for prediction in preds]
+            with (self.save_dir / "validation_probe.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(self.validation_probe, ensure_ascii=False) + "\n")
+            LOGGER.info(f"验证首批诊断：候选={self.validation_probe.get('candidates_above_conf')}，"
+                        f"NMS后={self.validation_probe.get('after_nms')}，"
+                        f"内容区裁框后={self.validation_probe['after_content_clip']}")
+            self.validation_probe_written = True
         super().update_metrics(preds, batch)
         # 普通轮次也累计混淆矩阵，最佳轮可直接存图而无需额外模型前向。
         if not self.args.plots:
@@ -974,6 +1019,15 @@ class FusionDetectionTrainer(DetectionTrainer):
         LOGGER.info(f"第{self.epoch + 1}轮受限采样：{len(sampler.names)}张基本主样本 + "
                     f"{sampler.extra_count}张额外主样本；每图最多2次，每组额外≤{sampler.group_limit}")
 
+    def _model_train(self) -> None:
+        """每轮进入训练模式后固定BN统计，避免batch1造成训练/验证归一化失配。"""
+        super()._model_train()
+        if self.recipe.freeze_bn_stats:
+            # 只切换BN统计来源，不冻结weight/bias，也不让验证使用当前批次统计。
+            for module in self.model.modules():
+                if isinstance(module, torch.nn.BatchNorm2d):
+                    module.eval()
+
     def preprocess_batch(self, batch: dict[str, Any]) -> dict[str, Any]:
         """复用训练批次记录采样，不改变图像归一化或标签。"""
         if self.rgb_diagnostic and (batch["img"].ndim != 4 or batch["img"].shape[1] != 3):
@@ -1045,7 +1099,7 @@ class FusionDetectionTrainer(DetectionTrainer):
     def get_model(self, cfg: Any = None, weights: Any = None, verbose: bool = True) -> FusionDetectionModel | EarlyFusionDetectionModel:
         """分离官方迁移、最佳权重微调和同配方中断恢复，不混用优化状态。"""
         if weights is None:
-            raise ValueError("请从本地官方YOLO26l预训练权重创建融合模型")
+            raise ValueError("请从本地官方YOLO26预训练权重创建融合模型")
         source = (weights.get("ema") or weights["model"]) if isinstance(weights, dict) else weights
         model_type = (RGBDiagnosticModel if self.rgb_diagnostic else QualityFusionDetectionModel if self.quality_fusion
                       else EarlyFusionDetectionModel if self.early_fusion else FusionDetectionModel)
@@ -1296,6 +1350,8 @@ class FusionDetectionTrainer(DetectionTrainer):
         super()._setup_train()
         if self.continuous_depth:
             configure_fp32()
+        if self.recipe.freeze_bn_stats:
+            LOGGER.info("BN统计固定：训练/验证均使用预训练运行均值和方差；BN仿射参数继续学习")
         start = 1 if self.early_fusion or self.quality_fusion else self.epochs - self.args.close_mosaic + 1
         self.stopper = PolishEarlyStopping(start, self.args.patience, self.recipe.min_delta, self.recipe.min_stop_epochs)
         files = ("train1.py", "src/modalities.py", "src/yolo/aic/__init__.py", "src/yolo/aic/model.py", "src/yolo/aic/training.py", "src/yolo/aic/data.py")

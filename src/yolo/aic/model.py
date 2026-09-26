@@ -265,8 +265,8 @@ class EarlyFusionDetectionModel(DetectionModel):
 
     def __init__(self, cfg: dict[str, Any], nc: int = 12, verbose: bool = True) -> None:
         super().__init__(deepcopy(cfg), ch=5, nc=nc, verbose=verbose)
-        if self.yaml.get("scale") != "l" or len(self.model) != 24:
-            raise ValueError("v10配方使用官方YOLO26l，不自动换模型规模")
+        if self.yaml.get("scale") not in {"l", "x"} or len(self.model) != 24:
+            raise ValueError("早期融合支持官方YOLO26l或YOLO26x的24层结构")
         self.early_fusion_version = EARLY_FUSION_VERSION
         self.content_hw = DEFAULT_CONTENT_HW
         self.end2end = False
