@@ -101,17 +101,11 @@ class FusionPredictor:
         self.training_sensor_augmentation = recipe.get("sensors")
         self.input_geometry = "float_native" if self.continuous_depth else "quality_native" if quality else self.geometry
         self.padding_values = [114, 114, 114, 0, 0] if self.continuous_depth else [114, 114, 114, 0, 0, 0] if quality else [114] * 5 if self.geometry == "native_square" else [114, 114, 114, 0, 0]
-        self.postprocess_counts: dict[str, int] = {
-            "nms_output_boxes": 0,
-            "content_clip_removed_boxes": 0,
-            "final_limit_removed_boxes": 0,
-            "images_with_final_limit": 0,
-        }
 
     @torch.inference_mode()
     def predict_batch(self, images: torch.Tensor, targets: list[dict[str, torch.Tensor]],
                       conf: float, max_det: int, iou: float, config: PredictionConfig) -> list[dict[str, torch.Tensor]]:
-        """单次FP32前向，沿用单标签NMS，在内容裁边和坐标还原后限制框数。"""
+        """只做一次模型前向，用训练验证相同的NMS与原图坐标还原。"""
         channels = 6 if self.architecture == "quality_v19" else 5
         dtype = torch.float32 if self.continuous_depth else torch.uint8
         if images.dtype != dtype or images.ndim != 4 or tuple(images.shape[1:]) != (channels, *canvas_shape(self.content_hw)):
@@ -124,15 +118,12 @@ class FusionPredictor:
             images = images.contiguous(memory_format=torch.channels_last)
         with torch.autocast(device_type=self.device.type, enabled=False):
             predictions = self.model(images)
-            raw_predictions = predictions[0] if isinstance(predictions, (tuple, list)) else predictions
-            # 补边退化框可能占据前100名；NMS保留候选，真实内容裁边后才限制提交数量。
-            nms_max_det: int = raw_predictions.shape[-1]
             if config.classes is None and not config.agnostic_nms:
-                rows = single_label_nms(raw_predictions, conf, iou, nms_max_det)
+                rows = single_label_nms(predictions, conf, iou, max_det)
             else:
                 rows = nms.non_max_suppression(
-                    raw_predictions, conf, iou, nc=12, classes=config.classes,
-                    multi_label=False, agnostic=config.agnostic_nms, max_det=nms_max_det,
+                    predictions, conf, iou, nc=12, classes=config.classes,
+                    multi_label=False, agnostic=config.agnostic_nms, max_det=max_det,
                     end2end=False, max_time_img=float("inf"),
                 )
         outputs: list[dict[str, torch.Tensor]] = []
@@ -141,13 +132,7 @@ class FusionPredictor:
             geometry = tuple(target["geometry"].tolist())
             boxes, keep = clip_canvas_boxes(row[:, :4], geometry, (height, width))
             boxes = restore_boxes(boxes, geometry, (height, width))
-            limited: int = max(0, len(boxes) - max_det)
-            self.postprocess_counts["nms_output_boxes"] += len(row)
-            self.postprocess_counts["content_clip_removed_boxes"] += len(row) - len(boxes)
-            self.postprocess_counts["final_limit_removed_boxes"] += limited
-            self.postprocess_counts["images_with_final_limit"] += int(limited > 0)
-            row = row[keep][:max_det]
-            outputs.append({"boxes": boxes[:max_det], "scores": row[:, 4], "labels": row[:, 5].long()})
+            outputs.append({"boxes": boxes, "scores": row[keep, 4], "labels": row[keep, 5].long()})
         return outputs
 
 
@@ -327,14 +312,9 @@ def create_backend(config: PredictionConfig):
         metadata.update({
             "fusion_version": model.version, "architecture": model.architecture,
             "content_hw": list(model.content_hw), "tensor_hw": list(canvas_shape(model.content_hw)),
-            "training_evaluation_protocol": EVALUATION_PROTOCOL, "epoch": epoch, "weights_kind": "ema",
-            "prediction_protocol": "fp32_single_label_content_clip_then_limit_v1",
-            "yolo_profile": None, "postprocess": "single_label_nms_content_clip_then_limit",
-            "nms_function": "shared_single_label_nms" if
+            "evaluation_protocol": EVALUATION_PROTOCOL, "epoch": epoch, "weights_kind": "ema",
+            "yolo_profile": None, "postprocess": "shared_single_label_nms" if
                 config.classes is None and not config.agnostic_nms else "configured_single_label_nms",
-            "postprocess_order": ["single_label_nms", "clip_content", "restore_original", "limit_detections"],
-            "nms_candidate_limit": 30000, "nms_return_limit": "raw_prediction_positions",
-            "postprocess_counts": model.postprocess_counts,
             "rect": False, "validation_geometry": model.geometry, "padding_values": model.padding_values,
             "preprocess": FLOAT_PREPROCESS_VERSION if model.continuous_depth else
                 QUALITY_PREPROCESS_VERSION if model.architecture == "quality_v19" else

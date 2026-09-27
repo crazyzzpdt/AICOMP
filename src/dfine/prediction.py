@@ -178,9 +178,7 @@ def create_backend(config: PredictionConfig):
     metadata = {
         "backend": "dfine", "variant": model.variant, "dfine_commit": DFINE_COMMIT, "epoch": model.epoch,
         "nms": False, "iou": None, "multi_label": None, "rect": False,
-        "postprocess": "sigmoid_query_class_topk", "preprocess": model.preprocess, "weights_kind": "ema",
-        "candidate_topk": 300,
-        "postprocess_order": ["sigmoid_query_class_topk", "restore_and_clip_original", "filter_conf_finite_nonempty", "limit_detections"],
+        "postprocess": "native_query_class_topk", "preprocess": model.preprocess, "weights_kind": "ema",
         "input_dtype": "float32" if model.continuous_depth else "uint8",
         "continuous_modalities": model.continuous_depth,
         "training_sensor_augmentation": model.training_sensor_augmentation,
