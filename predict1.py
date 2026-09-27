@@ -16,7 +16,7 @@ from src.yolo.prediction import PredictionConfig, predict
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26x_1536_v27_bn_fix/weights/best.pt"
 SOURCE_PATH: Path = PROJECT_ROOT / "datasets/test"
-OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v27_yolo26x_bn_fix"
+OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v27_yolo26x_max100_clip_then_limit"
 
 
 if __name__ == "__main__":
@@ -47,8 +47,8 @@ if __name__ == "__main__":
 
         # 三、候选框与后处理
         conf=0.001,  # 与验证一致保留低分候选，不是展示图片的阈值
-        iou=0.7,  # 一对多检测头的NMS阈值
-        max_det=12,  # 用户选择每图保留12框；赛事手册允许100框，非类别数量限制
+        iou=0.7,  # 单标签NMS的去重阈值，不是赛事匹配IoU或扩框比例
+        max_det=100,  # 赛事最终上限；融合路径先NMS和内容裁边，再取前100框
         nms=True,  # 保持验证的一对多头，本路径不开放无NMS切换
         agnostic_nms=False,  # 不跨类别压制；True会改变重叠目标筛选口径
         classes=None,  # None预测全部12类，可用编号列表过滤，正式提交保持None

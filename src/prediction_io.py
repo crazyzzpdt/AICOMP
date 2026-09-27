@@ -191,8 +191,8 @@ def prediction_rows(result: Results) -> np.ndarray:
     return rows
 
 
-def save_prediction(result: Results, image_name: str, output: Path, config: OutputConfig) -> None:
-    """写入同名带框图片和六列标签；展示阈值不影响提交候选。
+def save_prediction(result: Results, image_name: str, output: Path, config: OutputConfig) -> int:
+    """写入图片与六列标签，返回实际TXT框数；展示阈值不影响提交。
 
     Args:
         result: 已恢复原图坐标的检测结果。
@@ -212,7 +212,7 @@ def save_prediction(result: Results, image_name: str, output: Path, config: Outp
     with label_path.open("x", encoding="utf-8", newline="\n") as handle:
         handle.write(content)
     if not config.save:
-        return
+        return len(rows)
     # 绘图也使用实际提交的框，只有显示阈值不同；原始 Results 不做阈值修改。
     visible_rows = rows[rows[:, 5] >= config.visual_conf]
     height, width = result.orig_shape
@@ -228,6 +228,7 @@ def save_prediction(result: Results, image_name: str, output: Path, config: Outp
         raise OSError(f"预测图片编码失败：{image_path}")
     with image_path.open("xb") as handle:
         handle.write(encoded.tobytes())
+    return len(rows)
 
 
 def build_submission(output: Path, image_names: list[str], save_images: bool = True) -> Path:
@@ -392,7 +393,8 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
     completed: int = 0
     reported: int = 0
     batch_sizes: Counter[int] = Counter()
-    pending_saves: deque[Future[None]] = deque()
+    detection_counts: Counter[int] = Counter()
+    pending_saves: deque[Future[int]] = deque()
     previous_cv_threads: int = cv2.getNumThreads()
     # 外层已经并行读写，避免每个线程再启动一组 OpenCV 线程争抢 CPU。
     cv2.setNumThreads(1)
@@ -412,7 +414,7 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
                         batch_sizes[len(group)] += 1
                     for sample, result in zip(group, results, strict=True):
                         while pending_saves and (pending_saves[0].done() or len(pending_saves) >= config.batch * config.prefetch_batches):
-                            pending_saves.popleft().result()
+                            detection_counts[pending_saves.popleft().result()] += 1
                         pending_saves.append(writer.submit(save_prediction, result, sample.path.name, output,
                                                            config))
                     completed += len(group)
@@ -422,12 +424,19 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
                     reported = completed
             # 所有保存异常必须在打包前传播，不能产生缺图缺标签的正式提交包。
             while pending_saves:
-                pending_saves.popleft().result()
+                detection_counts[pending_saves.popleft().result()] += 1
     except torch.cuda.OutOfMemoryError as error:
         raise RuntimeError(f"当前 batch={config.batch} 超出可用显存；请减小 batch 并指定新的 --output，已有结果保留") from error
     finally:
         cv2.setNumThreads(previous_cv_threads)
     elapsed = time.perf_counter() - started
+    submission_statistics: dict[str, object] = {
+        "images": sum(detection_counts.values()),
+        "total_boxes": sum(box_count * image_count for box_count, image_count in detection_counts.items()),
+        "empty_images": detection_counts[0],
+        "images_at_max_det": detection_counts[config.max_det],
+        "boxes_per_image_histogram": dict(sorted(detection_counts.items())),
+    }
     metadata: dict[str, object] = {
         "created_at": datetime.now().astimezone().isoformat(), "entrypoint": entrypoint,
         "weights": weights.name, "phase": "round2", "source_hashes": source_hashes,
@@ -441,6 +450,7 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
         "workers": config.workers, "save_workers": config.save_workers,
         "prefetch_batches": config.prefetch_batches, "png_compression": config.png_compression,
         "actual_batch_sizes": dict(sorted(batch_sizes.items())),
+        "submission_statistics": submission_statistics,
         "pipeline_seconds": elapsed, "pipeline_images_per_second": len(samples) / elapsed,
         "configuration": json.loads(json.dumps(asdict(config), default=str)),
         **backend_metadata,
@@ -449,6 +459,9 @@ def run_prediction(config: OutputConfig, create_backend, source_paths: tuple[str
     with archive.open("rb") as handle:
         metadata["submission_sha256"] = hashlib.file_digest(handle, "sha256").hexdigest()
     print(f"读取、推理、绘图与保存共 {elapsed:.1f} 秒，平均 {len(samples) / elapsed:.2f} 组/秒（不含模型加载与 ZIP 打包）")
+    print(f"提交TXT统计：{submission_statistics['images']} 份，共 {submission_statistics['total_boxes']} 框，"
+          f"空检测 {submission_statistics['empty_images']} 张，达到 {config.max_det} 框上限 {submission_statistics['images_at_max_det']} 张；"
+          "触顶不等于确认截断或真实漏检")
     package = build_round2_package(config, archive)
     record = package / f"{TEAM_ID}-代码与数据" / "prediction.json"
     with record.open("x", encoding="utf-8") as handle:
