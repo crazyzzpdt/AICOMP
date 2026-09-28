@@ -61,6 +61,8 @@ MIN_POLISH_EPOCHS: int = 20
 # 每进程有限缓存；学习率周期保持整理前的计算方式。
 IMAGE_BUFFER_LIMIT: int = 8
 LR_DECAY_EPOCHS: int = 200
+# v28首次正式训练的训练器源码摘要；只允许跨越“连续浮点误禁resume”这一处修复。
+RESUME_GUARD_FIX_BASE_HASH: str = "2b3faf22e88b2fd4b9b9f73eb29debd1b7ea5fb12eae2c7386f6e1a32673c0cd"
 # 内部包迁移后仍以仓库根目录查找入口与审计。
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[3]
 
@@ -933,10 +935,10 @@ class FusionDetectionTrainer(DetectionTrainer):
         super().__init__(*args, **kwargs)
         if self.continuous_depth:
             if (recipe.architecture not in {"early_v10", "reliability_v28"} or not self.native_square or recipe.split_stem or
-                    self.args.resume or recipe.training_stage != "main" or self.args.amp or self.args.cache or
+                    recipe.training_stage != "main" or self.args.amp or self.args.cache or
                     self.args.augmentations is not None or any(getattr(self.args, key) != 0 for key in
                     ("mixup", "cutmix", "copy_paste", "hsv_h", "hsv_s", "hsv_v", "bgr"))):
-                raise ValueError("浮点训练要求早期或v28融合/原生方形/FP32/官方基底，不恢复历史训练或叠加非传感器颜色增强")
+                raise ValueError("浮点训练要求早期或v28融合/原生方形/FP32/main，且不能叠加非传感器颜色增强")
             configure_fp32()
         if self.args.imgsz != recipe.image_width or self.args.rect or self.args.multi_scale:
             raise ValueError("imgsz须等于配方宽度；训练rect和multi_scale须关闭")
@@ -1141,7 +1143,8 @@ class FusionDetectionTrainer(DetectionTrainer):
                 raise ValueError("首训只接受官方RGB预训练，不能恢复旧五通道或D-FINE模型")
         load_source = copy(source)
         load_source.names = {key: "ball" if str(name).lower() == "sports ball" else name for key, name in source.names.items()}
-        if self.quality_fusion and self.resume:
+        if (self.quality_fusion or self.reliability_fusion) and self.resume:
+            # 新结构必须逐项恢复编码器、门控和动态缓冲，不能依赖宽松交集加载。
             model.load_state_dict(load_source.float().state_dict(), strict=True)
             model.pt_path = getattr(load_source, "pt_path", None)
         elif self.recipe.split_stem and self.resume:
@@ -1424,8 +1427,27 @@ class FusionDetectionTrainer(DetectionTrainer):
                 "initialization": "official_rgb_ir_layers_0_to_4_depth_first_32_filters",
             }
         if self.resume_metadata:
-            if self.resume_metadata["signature"] != self.training_signature:
+            previous_signature = deepcopy(self.resume_metadata["signature"])
+            current_signature = deepcopy(self.training_signature)
+            previous_sources = previous_signature.pop("sources", {})
+            current_sources = current_signature.pop("sources", {})
+            previous_compatibility = previous_signature.pop("resume_compatibility", None)
+            current_signature.pop("resume_compatibility", None)
+            previous_training_hash = previous_sources.pop("src/yolo/aic/training.py", None)
+            current_training_hash = current_sources.pop("src/yolo/aic/training.py", None)
+            guard_fix = (previous_training_hash == RESUME_GUARD_FIX_BASE_HASH and
+                         previous_compatibility is None and self.reliability_fusion)
+            if (previous_signature != current_signature or previous_sources != current_sources or
+                    (previous_training_hash != current_training_hash and not guard_fix)):
                 raise ValueError("断点的配方、数据审计或源码已改变，请新训而非混合恢复")
+            if guard_fix:
+                self.training_signature["resume_compatibility"] = {
+                    "reason": "continuous_fp32_resume_guard_fix",
+                    "previous_training_sha256": previous_training_hash,
+                }
+                LOGGER.info("断点兼容：仅跨越连续FP32误禁resume修复；配方、数据审计、模型和其余源码摘要均一致")
+            elif previous_compatibility is not None:
+                self.training_signature["resume_compatibility"] = previous_compatibility
             if any(key in self.requested and self.requested[key] != value for key, value in settings.items()):
                 raise ValueError("恢复时请求参数与检查点配方不同")
             self.stopper.best = self.resume_metadata["stop_best"]

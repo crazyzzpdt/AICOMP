@@ -43,7 +43,7 @@ POLISH_START_EPOCH: int = 41
 # 不设置AP硬门槛；独立预算与总日程一致，连续50轮无提升可提前停止。
 BUDGET_EPOCHS: int = MAX_EPOCHS
 # 新浮点协议只从官方基底开始，不接入旧训练状态。
-RESUME_PATH: str | None = None
+RESUME_PATH: str | None = r"runs\detect\AIC_RGBIRDepth_yolo26x_1536_v28_reliability\weights\last.pt"
 
 
 # Windows DataLoader子进程会重新导入脚本，正式训练必须放在入口保护内。
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent)
     configure_fp32()
 
-    # 保留训练器与数据审计；新五通道配方独立，不能恢复旧断点。
+    # 保留训练器与数据审计；只允许恢复当前v28同配方未完成的last.pt。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
         architecture="reliability_v28",  # RGB独立骨干+轻量IR/Depth分支，P3/P4/P5质量门控融合
         continuous_depth=True,  # 原始16位深度直接转FP32，不经过8位取整

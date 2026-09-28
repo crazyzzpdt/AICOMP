@@ -1,5 +1,7 @@
 # 仓库协作规范
 
+2026-09-29 v28断点恢复修复（最新）：用户在第61轮93%手动中断；有效last.pt保存到第60轮，epoch=59、completed=False、optimizer存在、updates=8335。train1的RESUME_PATH指向该last.pt正确。原训练器连续FP32校验无条件拒绝self.args.resume，与后续恢复实现冲突；现允许同配方恢复，v28采用strict state_dict恢复全部分支，并只对首次v28训练器SHA256 `2b3faf...73c0cd`开放一次resume guard修复兼容。配方、数据审计、模型版本、框架和其余源码仍须完全一致；新检查点记录resume_compatibility。恢复从第61轮开头重跑，不保留中断轮已计算但未验证的93%批次。未自动启动训练。
+
 2026-09-27 v28重设计（最新）：v27两架构已完成，YOLO复赛51.9220、D-FINE51.2940。用户要求将未开训的v28改为结构实验，仍编号v28；train1使用reliability_v28，输出AIC_RGBIRDepth_yolo26x_1536_v28_reliability。新增src/yolo/aic/reliability.py：独立RGB骨干、轻量GN模态分支、P3/P4局部IR对应、P3–P5质量残差门控及P2细节到P3；官方X迁移，零投影起点、连续FP32、固定BN统计，1536/batch1/nbs16，100轮、patience50、第41轮收尾。官方1900/100原标签不变。predict1支持新类签名；两预测入口仍默认v27权重，以max_det100新目录做对照。train2不改。已做有界CPU合成小图损失/梯度/重载及浮点几何检查，未开正式训练、1536 GPU实测、全量预测或推送；不得把检查当作已提分。正式启动前仍须创建源码文档Git基点。文献是设计参考，没有完整复现蒸馏/RSDet；详见docs/v28复赛训练方案.md。v27实际衰减周期是min(300,200)=200，不能再写成300轮余弦。
 
 2026-09-26 YOLO v27 BN修复（最新）：用户恢复原v27第3轮检查点；6次1536单图CPU前向对照发现，原EMA运行BN统计使分类logits最高128.846、深层特征1273，仅替换官方BN均值/方差后logits最高1.259。固定BN统计的训练/验证同图logits差值0，178个BN统计不更新、仿射参数仍训练。FusionRecipe.freeze_bn_stats默认False，train1显式True；原故障运行保留，修正版目录v27_bn_fix，predict1同步。保留用户300轮及第41轮收尾（close_mosaic动态260）、FP32/batch1/1536、官方1900/100，不resume异常last。未进行GPU/反向/全量验证或正式训练，不把单图证据当成完整AP证明；D-FINE-X进程继续运行且其源码未改。诊断报告在runs/diagnostics/v27_cpu_bn_20260926，详见docs/浮点三模态实施方案.md；未提交推送。
