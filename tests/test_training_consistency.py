@@ -220,6 +220,7 @@ def test_polish_entry_assigns_names_without_remapping(polish_pair: tuple, monkey
     trainer, source, target = polish_pair
     trainer.early_fusion, trainer.resume, trainer.resume_metadata = True, False, None
     trainer.rgb_diagnostic, trainer.quality_fusion = False, False
+    trainer.reliability_fusion = False
     trainer.data = {"nc": 12, "names": dict(enumerate(data.CLASS_NAMES))}
     trainer.args.cls_remap = False
     target.names = {i: str(i) for i in range(12)}

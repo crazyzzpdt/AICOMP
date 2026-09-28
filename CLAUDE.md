@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+2026-09-27当前：train1为尚未开训的v28_reliability，结构代码src/yolo/aic/reliability.py；官方1900/100原标签、1536/FP32/batch1、100轮余弦/50轮耐心。predict1已支持新模型，两预测入口默认仍选v27成品，以max_det100新输出对照；train2不改。只做必要CPU小图边界检查，没有正式训练或1536显存实测，不自动加测、开训或推送。不因代码修改递增为v29；开训前须保存源码文档Git基点。以docs/v28复赛训练方案.md及AGENTS.md最新段落为准，下面旧划分等是历史。
+
 2026-09-24目录整理：保留根train1/train2/predict1/predict2入口；YOLO在src/yolo/aic，公共浮点处理src/modalities.py，D-FINE项目适配src/dfine/{training,runtime}.py，上游核心/配置src/D-FINE；工具统一tools/dfine及既有tools，历史源码tools/archive/run_snapshots（不入Git）。删除空common、重复aic/aic和迁空src/tools；runs审计、模型及日志保留。当前官方标签1700/300，不恢复历史清洗。此次不改变训练参数，不测试或运行模型；已有未提交内存修复及用户预测配置保留本地，目录变动与引用单独提交推送。
 
 2026-09-24 v24最终复盘：v24完成72轮，best42 AP95=0.4008757256/AP50=0.6279537053，末轮AP95=0.38451；它是1709/291同协议最高训练峰值，但best后30轮未刷新且训练损失继续下降，判定存在后期过拟合，不从last盲目续训。现场活动进程实际为v26_no_tone，v25已经完成。后续每个新版本代码完成后、启动训练前必须先创建独立Git提交；有推送授权时同步GitHub，且排除数据、权重、runs和用户无关文件。

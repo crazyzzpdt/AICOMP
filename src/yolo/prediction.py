@@ -16,6 +16,7 @@ from ultralytics.models.yolo.detect.predict import DetectionPredictor
 from ultralytics.utils import nms, ops
 
 from src.modalities import FLOAT_PREPROCESS_VERSION, configure_fp32, read_float_modalities, letterbox_float
+from src.yolo.aic.reliability import RELIABILITY_FUSION_VERSION, ReliabilityFusionDetectionModel
 from src.yolo.aic.data import CLASS_NAMES, QUALITY_PREPROCESS_VERSION, fuse_modalities, fuse_quality_modalities
 from src.yolo.aic.model import (EARLY_FUSION_VERSION, EVALUATION_PROTOCOL, FUSION_VERSION, SPLIT_STEM_VERSION, QUALITY_FUSION_VERSION,
     EarlyFusionDetectionModel, FusionDetectionModel, SplitModalStem, QualityFusionDetectionModel,
@@ -63,9 +64,10 @@ class FusionPredictor:
     def __init__(self, model: FusionDetectionModel | EarlyFusionDetectionModel, device: str, content_hw: tuple[int, int]) -> None:
         early = isinstance(model, EarlyFusionDetectionModel)
         quality = isinstance(model, QualityFusionDetectionModel)
+        reliability = isinstance(model, ReliabilityFusionDetectionModel)
         version = getattr(model, "early_fusion_version" if early else "fusion_version", None)
         split_stem = early and isinstance(model.model[0], SplitModalStem)
-        expected = QUALITY_FUSION_VERSION if quality else SPLIT_STEM_VERSION if split_stem else EARLY_FUSION_VERSION if early else FUSION_VERSION
+        expected = RELIABILITY_FUSION_VERSION if reliability else QUALITY_FUSION_VERSION if quality else SPLIT_STEM_VERSION if split_stem else EARLY_FUSION_VERSION if early else FUSION_VERSION
         if version != expected or tuple(getattr(model, "content_hw", ())) != tuple(content_hw):
             raise ValueError(f"权重版本{version}、高宽{getattr(model, 'content_hw', None)}不匹配；请使用对应源码和预测尺寸")
         self.device = torch.device("cpu" if str(device) == "cpu" else f"cuda:{int(device)}")
@@ -75,7 +77,7 @@ class FusionPredictor:
         self.names = model.names
         self.content_hw = content_hw
         self.version = version
-        self.architecture = "quality_v19" if quality else "split_stem_v18" if split_stem else "early_fusion" if early else "gated_fusion"
+        self.architecture = "reliability_v28" if reliability else "quality_v19" if quality else "split_stem_v18" if split_stem else "early_fusion" if early else "gated_fusion"
         signature = getattr(model, "fusion_training", {}).get("signature", {})
         recipe = signature.get("recipe", {})
         self.geometry = recipe.get("geometry", "fixed_rect")
@@ -95,9 +97,14 @@ class FusionPredictor:
         if bool(recipe.get("continuous_depth", False)) != self.continuous_depth:
             raise ValueError("浮点输入协议与训练签名不一致")
         if self.continuous_depth and (
-                self.geometry != "native_square" or not early or split_stem or
+                self.geometry != "native_square" or not (early or reliability) or split_stem or
                 signature.get("float_preprocessing", {}).get("version") != FLOAT_PREPROCESS_VERSION):
             raise ValueError("连续浮点权重缺少一致的训练预处理签名，不能回退为旧8位输入")
+        if reliability and (not self.continuous_depth or recipe.get("architecture") != "reliability_v28" or
+                signature.get("version") != RELIABILITY_FUSION_VERSION or
+                signature.get("reliability_fusion", {}).get("version") != RELIABILITY_FUSION_VERSION or
+                signature.get("evaluation_protocol") != EVALUATION_PROTOCOL):
+            raise ValueError("v28权重缺少一致的融合结构/浮点输入/评估协议签名")
         self.training_sensor_augmentation = recipe.get("sensors")
         self.input_geometry = "float_native" if self.continuous_depth else "quality_native" if quality else self.geometry
         self.padding_values = [114, 114, 114, 0, 0] if self.continuous_depth else [114, 114, 114, 0, 0, 0] if quality else [114] * 5 if self.geometry == "native_square" else [114, 114, 114, 0, 0]

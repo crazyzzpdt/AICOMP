@@ -1,5 +1,7 @@
 # 仓库协作规范
 
+2026-09-27 v28重设计（最新）：v27两架构已完成，YOLO复赛51.9220、D-FINE51.2940。用户要求将未开训的v28改为结构实验，仍编号v28；train1使用reliability_v28，输出AIC_RGBIRDepth_yolo26x_1536_v28_reliability。新增src/yolo/aic/reliability.py：独立RGB骨干、轻量GN模态分支、P3/P4局部IR对应、P3–P5质量残差门控及P2细节到P3；官方X迁移，零投影起点、连续FP32、固定BN统计，1536/batch1/nbs16，100轮、patience50、第41轮收尾。官方1900/100原标签不变。predict1支持新类签名；两预测入口仍默认v27权重，以max_det100新目录做对照。train2不改。已做有界CPU合成小图损失/梯度/重载及浮点几何检查，未开正式训练、1536 GPU实测、全量预测或推送；不得把检查当作已提分。正式启动前仍须创建源码文档Git基点。文献是设计参考，没有完整复现蒸馏/RSDet；详见docs/v28复赛训练方案.md。v27实际衰减周期是min(300,200)=200，不能再写成300轮余弦。
+
 2026-09-26 YOLO v27 BN修复（最新）：用户恢复原v27第3轮检查点；6次1536单图CPU前向对照发现，原EMA运行BN统计使分类logits最高128.846、深层特征1273，仅替换官方BN均值/方差后logits最高1.259。固定BN统计的训练/验证同图logits差值0，178个BN统计不更新、仿射参数仍训练。FusionRecipe.freeze_bn_stats默认False，train1显式True；原故障运行保留，修正版目录v27_bn_fix，predict1同步。保留用户300轮及第41轮收尾（close_mosaic动态260）、FP32/batch1/1536、官方1900/100，不resume异常last。未进行GPU/反向/全量验证或正式训练，不把单图证据当成完整AP证明；D-FINE-X进程继续运行且其源码未改。诊断报告在runs/diagnostics/v27_cpu_bn_20260926，详见docs/浮点三模态实施方案.md；未提交推送。
 
 2026-09-25 v27双X方案（最新优先）：用户授权YOLO26x和D-FINE-X、1536输入、100张稀有类覆盖验证。datasets现为官方原文1900/100，审计runs/dataset_cleaning/official_labels_split_1900_100_v27/manifest.json；200组三模态及标签从val移入train，标签修改0，原数据/test不动。两个入口均v27、官方基底、FP32/batch1/有效16、主5e-5骨干1e-5、patience50；YOLO120轮第41轮弱增强、D-FINE60轮第41轮关闭尺度扰动。预测默认两套X best、每图12框为用户策略，不是官方上限；验证仍100框。新D-FINE保存variant并兼容旧L推理。未测试/模型运行/开训，未提交推送；开训前必须保存仅本版本源码文档的Git基点。旧1700/300及v26当前入口描述均为历史。详见docs/浮点三模态实施方案.md。

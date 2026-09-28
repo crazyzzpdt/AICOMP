@@ -1,9 +1,9 @@
-"""v27双架构对比：YOLO26x五通道连续FP32训练。
+"""v28复赛候选：YOLO26x局部质量融合、浅层细节注入与100轮日程。
 
 使用官方原标签1900/100整组划分，1536原生方形输入；不继承L规模历史权重。
 运行：uv run python train1.py。与train2.py分别启动，不同时占用GPU。
-验证保留100个候选用于AP；预测每图12框是用户提交策略，不是赛事硬上限。
-本轮尚未实测X模型峰值显存，不自动探测或失败重试。
+训练验证与预测均最多保留100框，展示阈值不影响提交标签。
+RGB骨干独立，IR/Depth轻量分支以P3–P5残差融合；新增结构尚未正式训练。
 """
 
 # 内置库
@@ -25,7 +25,7 @@ from src.yolo.aic.training import FusionDetectionTrainer, FusionRecipe
 from src.modalities import SensorAugment, configure_fp32
 
 
-# 使用官方RGB预训练权重迁移到五通道首层，不续训历史赛事权重。
+# 迁移官方RGB骨干与检测头，新增IR/Depth及细节分支独立学习。
 MODEL_PATH: str = "./orgin_models/yolo26x.pt"
 # 使用官方新版标签原文与1900/100划分；审计只验证内容，不修订标签。
 DATA_PATH: str = "./datasets/data.yaml"
@@ -33,15 +33,15 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_labels_split_1900_100_v27/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26x_1536_v27_bn_fix"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26x_1536_v28_reliability"
 # 1536方形等比填充；展示图片与TXT坐标仍还原到原图。
 IMAGE_HW: tuple[int, int] = (1536, 1536)
-# 官方X基底重新迁移，300轮完整余弦日程。
-MAX_EPOCHS: int = 300
+# 官方X基底重新迁移，在100轮内完成余弦衰减，避免早停前学习率长期偏高。
+MAX_EPOCHS: int = 100
 # 第41轮开始弱增强收尾；总轮数改变时不再把收尾一起推迟。
 POLISH_START_EPOCH: int = 41
-# 不设置AP硬门槛，最多300轮并由50轮耐心早停控制。
-BUDGET_EPOCHS: int = 300
+# 不设置AP硬门槛；独立预算与总日程一致，连续50轮无提升可提前停止。
+BUDGET_EPOCHS: int = MAX_EPOCHS
 # 新浮点协议只从官方基底开始，不接入旧训练状态。
 RESUME_PATH: str | None = None
 
@@ -53,7 +53,7 @@ if __name__ == "__main__":
 
     # 保留训练器与数据审计；新五通道配方独立，不能恢复旧断点。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
-        architecture="early_v10",  # RGB3+IR1+Depth1五通道共享骨干，作为正式三模态候选
+        architecture="reliability_v28",  # RGB独立骨干+轻量IR/Depth分支，P3/P4/P5质量门控融合
         continuous_depth=True,  # 原始16位深度直接转FP32，不经过8位取整
         freeze_bn_stats=True,  # batch1固定官方BN均值/方差；缩放、偏置及其他参数继续训练
         sensors=SensorAugment(
@@ -62,15 +62,15 @@ if __name__ == "__main__":
             rgb_exposure_probability=0.0,  # 关闭新增RGB曝光扰动
         ),  # 保留深度有效区扰动；这些随机增强不用于验证/推理
         split_stem=False,  # 不引入v18拆分首层或v19分支
-        budget_epochs=BUDGET_EPOCHS,  # 允许完整300轮日程，避免把第20轮误判为最终上限
+        budget_epochs=BUDGET_EPOCHS,  # 允许完整100轮日程，不用首轮AP判断最终上限
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
         min_stop_epochs=20,  # 保留v14最低耐心停止轮数；阶段筛选独立生效
         initial_weights_sha256=None,  # 无微调父权重，训练器仍记录实际初始化来源
         image_height=IMAGE_HW[1],  # 原生训练画布高度1536
         image_width=IMAGE_HW[0],  # 与下方imgsz一致
         backbone_lr=0.0001,  # 历史v9专用，本轮骨干由early_backbone_lr指定
-        auxiliary_lr=0.0001,  # 配方兼容字段，本轮没有辅助分支参数
-        early_backbone_lr=0.00001,  # v21骨干2e-5减半，保持骨干与检测头0.2倍比例
+        auxiliary_lr=0.0001,  # 新增编码器、局部门控、对应投影与P2细节分支
+        early_backbone_lr=0.00001,  # RGB第0–10层统一低学习率，保护预训练表征
         val_batch=1,  # 与v14正式训练轨迹一致，不拿batch2复评替代逐轮对照
         min_delta=0.0,  # 沿用v14，真实AP95新高即可重置耐心
         polish_scale=0.1,  # 第41轮起减少缩放扰动，保留完整目标细节
@@ -81,20 +81,20 @@ if __name__ == "__main__":
         repeat_threshold=0.0,  # v17未改善总体AP95，关闭受限重复，回到v14基本采样
     ))
 
-    # 官方RGB权重与类别语义迁移；不加载历史赛事权重或新增辅助编码器。
+    # 迁移官方RGB权重及类别语义；新增投影初始为零，随后学习三模态残差。
     model = YOLO(RESUME_PATH or MODEL_PATH)
 
     # 训练函数：保留原生YOLO进度条、损失和轮末验证输出。
     model.train(
         # 一、模型、数据与训练时长
-        trainer=trainer,  # 保留审计与原生几何，网络接收五通道，验证协议不变
+        trainer=trainer,  # 五通道由网络拆分，训练验证共用连续浮点与质量门控
         model=RESUME_PATH or MODEL_PATH,  # 与上方YOLO实例使用相同基底或恢复权重
         mode="train",  # 显式记录运行模式，model.train也会固定此值
         data=DATA_PATH,  # 只读取datasets，不修改官方源文件
         cfg=None,  # 不使用额外覆盖配置文件，所有参数在此处显式给出
         project=PROJECT_PATH,  # 正式训练产物根目录
         name=RUN_NAME,  # 重名自动另建目录，预测时填写实际路径
-        epochs=MAX_EPOCHS,  # 用户选择300轮余弦日程，无20轮预算截断
+        epochs=MAX_EPOCHS,  # 100轮完整余弦日程，无20轮预算截断
         time=None,  # 不按小时强制截断，训练由epochs和早停控制
         resume=RESUME_PATH or False,  # 仅恢复同配方中断检查点
         pretrained=True,  # 官方COCO预训练迁移，不加载历史赛事权重续训
@@ -118,9 +118,9 @@ if __name__ == "__main__":
 
         # 三、优化器、学习率与收敛
         optimizer="AdamW",  # 沿用v4优化器，不用auto切换
-        lr0=0.00005,  # v21首层/颈部/双头1e-4减半，检验早期更新幅度是否过大
-        lrf=0.01,  # 恢复v14的120轮余弦末端为初始学习率1%
-        cos_lr=True,  # 不继续v16的60轮快速衰减组合
+        lr0=0.00005,  # Neck与双头学习率；RGB骨干和新增分支由配方分别指定
+        lrf=0.01,  # 第100轮附近降到初始学习率的1%
+        cos_lr=True,  # v27实际衰减200轮；本轮100轮内更早进入低学习率阶段
         momentum=0.9,  # AdamW第一动量系数
         weight_decay=0.0005,  # 沿用v4量级，偏置和归一化参数不衰减
         warmup_epochs=5.0,  # 官方基底重迁移，沿用v14的5轮预热
@@ -129,10 +129,10 @@ if __name__ == "__main__":
         freeze=None,  # 全部五通道模型参数可训练，不额外冻结骨干
 
         # 四、同步增强与关闭拼图阶段
-        mosaic=0.5,  # 浮点画布：RGB填114、IR/Depth填0，三模态同步几何
-        close_mosaic=MAX_EPOCHS - POLISH_START_EPOCH + 1,  # 300轮时为260，第41轮关闭拼图
-        scale=0.3,  # 沿用v14同步几何幅度
-        translate=0.1,  # 沿用v14平移幅度，关闭拼图后保持不变
+        mosaic=0.25,  # 降低拼图概率，增加原画面训练比例；三模态与框同步
+        close_mosaic=MAX_EPOCHS - POLISH_START_EPOCH + 1,  # 100轮时为60，第41轮关闭拼图
+        scale=0.2,  # 缩小范围由0.7–1.3收窄到0.8–1.2，减少小目标缩小
+        translate=0.1,  # 主训练平移不变，第41轮由polish_translate降到0.025
         fliplr=0.5,  # 训练和收尾均保留同步水平翻转
         flipud=0.0,  # 城市场景不做上下翻转
         hsv_h=0.0,  # 恢复v4，不在五通道原生增强链中改变颜色
@@ -171,7 +171,7 @@ if __name__ == "__main__":
         iou=0.7,  # 验证与预测共享单标签NMS
         nms=True,  # 正式输出使用一对多分支，不融合两头预测
         max_det=100,  # 赛事单图最多100框
-        patience=50,  # 用户要求连续50轮验证AP95无新高才早停；总上限仍120轮
+        patience=50,  # 连续50轮验证AP95无新高才早停；总日程上限100轮
         save=True,  # 保留best、best_map50及last
         save_period=5,  # 每5轮留存，最佳/末轮权重和逐类指标照常保存
         plots=True,  # 保留原生曲线、混淆矩阵和样本可视化
