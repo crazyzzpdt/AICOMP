@@ -1,5 +1,7 @@
 # 仓库协作规范
 
+2026-09-29 v29双框架（最新）：用户授权D-FINE同步可迁移策略、更新文档分步提交并推送GitHub。train2现为D-FINE-X v29_small_crop：原生五通道、官方Objects365重迁移、1536/FP32/batch1/有效16、主5e-5/骨干1e-5、60轮/patience50；新增与YOLO同规则的受限小目标原图裁剪，第41轮关闭。不把v28组合实验的本地改善当作单模块有效证据，不移植YOLO门控/双头或改成100轮。SmallObjectCrop与窗口选择迁入src/augmentation.py，两个训练器无互相导入，源码快照/摘要已补；YOLO训练数值不变，但源码摘要有变，旧断点用原快照恢复。19项CPU数据检查通过；未GPU测试、训练、预测或复评。原图/标签/1900/100与预测入口默认不改。D-FINE仍不支持resume，不能套YOLO恢复说明。详见docs/v29小目标训练方案.md；以下train2不改为前一阶段状态。
+
 2026-09-29 v29待训练（最新）：用户明确选择保留YOLO26x、针对小目标改进训练。train1改v29_small_crop，从官方X重新迁移、resume=None；保持v28 reliability结构/1536/FP32/batch1/nbs16/100轮/patience50，第41轮收尾。新增SmallObjectCrop：25%主样本尝试原图60%–80%同步裁剪，目标阈值64像素、相交框可见性≥80%、最多6次；成功分支不叠加Mosaic/仿射裁切，第41轮关闭，验证预测始终完整图。官方1900/100和磁盘原标签不改；无新增采样/教师/架构。small_crop_history.csv记录正式消费次数，配方纳入恢复签名。15项CPU几何/边界检查通过，未GPU测试、训练或推理，不因本次检查授权无限扩展测试。用户predict1默认和D-FINE均保留。正式启动前保存源码文档Git基点；当前无新推送授权，不自动开训。v28已完成89轮，best39 AP95=.4254824287，复赛三次50.484；线上最佳仍v27 51.922。详见docs/v29小目标训练方案.md。
 
 2026-09-29 v28断点恢复修复（最新）：用户在第61轮93%手动中断；有效last.pt保存到第60轮，epoch=59、completed=False、optimizer存在、updates=8335。train1的RESUME_PATH指向该last.pt正确。原训练器连续FP32校验无条件拒绝self.args.resume，与后续恢复实现冲突；现允许同配方恢复，v28采用strict state_dict恢复全部分支，并只对首次v28训练器SHA256 `2b3faf...73c0cd`开放一次resume guard修复兼容。配方、数据审计、模型版本、框架和其余源码仍须完全一致；新检查点记录resume_compatibility。恢复从第61轮开头重跑，不保留中断轮已计算但未验证的93%批次。未自动启动训练。

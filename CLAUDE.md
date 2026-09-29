@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+2026-09-29双框架追加：train2已授权接D-FINE-X v29_small_crop，保留原五通道/60轮/FP32/batch1，裁剪与YOLO共用src/augmentation.py，第41轮关闭；不移植尚未独立验证的YOLO门控。19项CPU数据检查通过，未开训/推理。用户授权分步Git提交并推送GitHub。下方train2不改为历史状态；按AGENTS最新记录和v29文档执行。
+
 2026-09-29当前：train1为待训练v29_small_crop，用户选择保留YOLO26x/v28结构、官方1900/100与1536 FP32 batch1；只新增受限小目标原图训练裁剪，第41轮关闭。15项CPU检查通过，未正式训练或GPU检查。predict1用户v28默认、train2均不改。详情及恢复边界以AGENTS最新段落和docs/v29小目标训练方案.md为准；下方v28尚未训练等为历史状态。
 
 2026-09-27当前：train1为尚未开训的v28_reliability，结构代码src/yolo/aic/reliability.py；官方1900/100原标签、1536/FP32/batch1、100轮余弦/50轮耐心。predict1已支持新模型，两预测入口默认仍选v27成品，以max_det100新输出对照；train2不改。只做必要CPU小图边界检查，没有正式训练或1536显存实测，不自动加测、开训或推送。不因代码修改递增为v29；开训前须保存源码文档Git基点。以docs/v28复赛训练方案.md及AGENTS.md最新段落为准，下面旧划分等是历史。
