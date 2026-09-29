@@ -16,7 +16,7 @@ from src.yolo.prediction import PredictionConfig, predict
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26x_1536_v28_reliability/weights/best.pt"
 SOURCE_PATH: Path = PROJECT_ROOT / "datasets/test"
-OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v27_yolo26x_max100"
+OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v28"
 
 
 if __name__ == "__main__":
