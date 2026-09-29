@@ -1,4 +1,4 @@
-"""执行D-FINE-X真实五通道连续浮点训练，不调用官方RGB数据入口。
+"""D-FINE-X v29：真实五通道连续浮点训练，新增受限小目标原图裁剪。
 
 运行：uv run python train2.py
 读取datasets官方原标签副本，不修改图像和标签；历史权重仅保留预测，不恢复旧训练。
@@ -21,6 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # 自己的模块
 from src.dfine.training import TrainingConfig, train
 from src.modalities import SensorAugment
+from src.augmentation import SmallObjectCrop
 
 
 # Windows子进程只导入配置和类，不重复启动训练。
@@ -31,7 +32,7 @@ if __name__ == "__main__":
         variant="x",  # 官方B5骨干、384维编码器与X解码器，由检查点传给预测
         data="datasets/data.yaml",  # 使用1900/100官方原始标签副本，不做标签清洗
         project="runs/detect",  # 与历史运行并存
-        name="AIC_RGBIRDepth_dfine_x_1536_v27",  # 待训练v27双架构对比，不覆盖历史产物
+        name="AIC_RGBIRDepth_dfine_x_1536_v29_small_crop",  # 新训练与YOLO同属v29，不覆盖已完成v27
         epochs=60,  # 固定短日程，结合轮末AP95早停
         resume=None,  # 不接收旧优化器或旧预处理断点
         data_audit="runs/dataset_cleaning/official_labels_split_1900_100_v27/manifest.json",
@@ -56,7 +57,7 @@ if __name__ == "__main__":
         ema_warmup=100,  # 按真实优化步计数
 
         # 四、同步几何与传感器增强
-        polish_epoch=40,  # 第41轮关闭尺度扰动；温和传感器扰动保留
+        polish_epoch=40,  # 第41轮同时关闭裁剪和尺度扰动；温和传感器扰动保留
         scale_min=0.9,  # 只缩小后填充，不裁掉目标
         fliplr=0.5,  # 三模态与标签同步翻转
         hsv_h=0.0,  # 不叠加HSV，保留基础传感器增强
@@ -67,6 +68,14 @@ if __name__ == "__main__":
             ir_local_probability=0.0,  # 关闭额外局部对比度
             rgb_exposure_probability=0.0,  # 关闭额外曝光扰动
         ),  # 保留IR传感器噪声与深度扰动；验证预测不随机增强
+        small_crop=SmallObjectCrop(
+            probability=0.25,  # 25%的训练样本尝试原图裁剪，不增加每轮样本数
+            min_fraction=0.6,  # 同步保留RGB/IR/Depth原宽高至少60%，保留目标上下文
+            max_fraction=0.8,  # 最多保留80%；先裁原图再浮点缩放，不放大已下采样图
+            max_object_size=64.0,  # 完整图长边缩放到1536后，框面积平方根小于64像素
+            min_visibility=0.8,  # 任意相交框不足80%可见就拒绝整个窗口，避免丢标碎片
+            attempts=6,  # 六次未找到窗口回退；成功裁剪后不再随机缩小
+        ),  # 验证与预测始终完整图；只转换内存标签，不改官方文件
 
         # 五、D-FINE损失与权重留存
         loss_vfl=1.0,  # 官方分类权重，不搬YOLO的cls

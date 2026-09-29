@@ -40,6 +40,7 @@ from tqdm import tqdm
 import yaml
 
 # 自己的模块
+from src.augmentation import SmallObjectCrop, choose_small_object_crop
 from src.modalities import (CLASS_NAMES, IMAGE_SUFFIXES, FLOAT_PREPROCESS_VERSION, SensorAugment,
                             read_float_modalities, letterbox_float, augment_sensors, configure_fp32)
 from src.dfine.runtime import check_source, build_model, decode_predictions
@@ -97,8 +98,9 @@ class TrainingConfig:
     seed: int
     save_period: int
     resume: str | None
-    # 新训练不恢复旧优化状态，也不叠加历史定向采样或裁剪。
+    # 新训练不恢复旧优化状态；裁剪默认关闭，只有v29入口显式开启。
     sensors: SensorAugment = SensorAugment()
+    small_crop: SmallObjectCrop = SmallObjectCrop()
     loss_vfl: float = 1.0
     loss_bbox: float = 5.0
     loss_giou: float = 2.0
@@ -248,10 +250,24 @@ class MultimodalDFineDataset(Dataset):
         training = self.split == "train"
         augmenting = training and self.epoch < self.config.polish_epoch
         labels = self.labels[index].copy()
+        crop_attempted = (augmenting and self.config.small_crop.probability > 0
+                          and random.random() < self.config.small_crop.probability)
+        crop_applied = False
+        if crop_attempted:
+            proposal = choose_small_object_crop(labels[:, 1:], labels[:, :1], image.shape[:2],
+                                                self.config.imgsz, self.config.small_crop)
+            if proposal is not None:
+                (crop_left, crop_top, crop_width, crop_height), keep, crop_boxes = proposal
+                # 原始五通道同时裁取；标签只改本次内存副本，不生成新数据文件。
+                image = image[crop_top:crop_top + crop_height, crop_left:crop_left + crop_width].copy()
+                labels = labels[keep]
+                labels[:, 1:] = crop_boxes
+                crop_applied = True
         if training:
             image = augment_sensors(image, metric_depth, self.config.sensors)
         height, width = image.shape[:2]
-        scale = random.uniform(self.config.scale_min, 1.0) if augmenting else 1.0
+        # 已裁剪的分支不再随机缩小；第41轮起两种尺度扰动都关闭。
+        scale = random.uniform(self.config.scale_min, 1.0) if augmenting and not crop_applied else 1.0
         canvas, geometry = letterbox_float(image, self.config.imgsz, scale=scale)
         sx, sy, left, top = geometry
         boxes = labels[:, 1:].copy()
@@ -273,7 +289,9 @@ class MultimodalDFineDataset(Dataset):
             canvas[:, :, :3] = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB) * 255.0
         target = {"labels": torch.tensor(labels[:, 0], dtype=torch.int64),
                   "boxes": torch.from_numpy(boxes), "image_id": torch.tensor(index),
-                  "orig_size": torch.tensor([width, height]), "geometry": torch.tensor(geometry)}
+                  "orig_size": torch.tensor([width, height]), "geometry": torch.tensor(geometry),
+                  "small_crop_attempted": torch.tensor(crop_attempted),
+                  "small_crop_applied": torch.tensor(crop_applied)}
         return image_tensor(canvas), target
 
 
@@ -463,7 +481,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     training = MultimodalDFineDataset(PROJECT_ROOT / config.data, "train", config)
     validation = MultimodalDFineDataset(PROJECT_ROOT / config.data, "val", config)
     adapter_hashes = {name: hashlib.sha256((PROJECT_ROOT / name).read_bytes()).hexdigest()
-                      for name in ("src/dfine/__init__.py", "src/dfine/training.py", "src/modalities.py", "src/dfine/runtime.py", "src/D-FINE/source_manifest.json")}
+                      for name in ("src/dfine/__init__.py", "src/dfine/training.py", "src/modalities.py", "src/augmentation.py", "src/dfine/runtime.py", "src/D-FINE/source_manifest.json")}
     if {p.stem for p in training.images} & {p.stem for p in validation.images}:
         raise ValueError("训练和验证存在同名样本，停止训练以避免泄漏")
     audit_hash: str | None = None
@@ -537,6 +555,12 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     recipe["loss_weights"] = dict(criterion.weight_dict)
     recipe["precision"] = "FP32_no_autocast_no_tf32"
     recipe["sampling"] = {"enabled": False, "samples_per_epoch": epoch_samples}
+    recipe["small_object_crop"] = {
+        **asdict(config.small_crop), "policy": "bounded_raw_crop_v29",
+        "scope": "train_only_before_resize", "stop_epoch": config.polish_epoch + 1,
+        "extra_scale_on_cropped_samples": False, "source_files_modified": False,
+        "validation_and_prediction": "full_image_unchanged",
+    }
     # 随正式训练留存类别和输入域组成，提醒本地验证的覆盖范围，不额外执行模型评估。
     recipe["dataset_composition"] = {
         split: {"images": len(dataset),
@@ -554,7 +578,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     if config.data_audit:
         shutil.copy2(PROJECT_ROOT / config.data_audit, output / "dataset_audit.json")
     for filename in ("train2.py", "predict2.py", "predict1.py", "src/__init__.py", "src/dfine/__init__.py", "src/dfine/training.py",
-                     "src/D-FINE/source_manifest.json", "src/modalities.py", "src/dfine/runtime.py", "pyproject.toml", "uv.lock"):
+                     "src/D-FINE/source_manifest.json", "src/modalities.py", "src/augmentation.py", "src/dfine/runtime.py", "pyproject.toml", "uv.lock"):
         target = snapshot / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT_ROOT / filename, target)
@@ -572,6 +596,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
         total_images = 0
+        crop_attempts = crop_applied = 0
         for step, (images, targets) in enumerate(tqdm(train_loader, desc=f"训练 {epoch + 1}/{config.epochs}", file=sys.stdout, mininterval=5)):
             update_index = updates_before_epoch + step // accumulate
             progress = update_index / max(total_updates - 1, 1)
@@ -580,6 +605,10 @@ def run_training(config: TrainingConfig, output: Path) -> None:
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * factor
             batch_count = images.shape[0]
+            # 由主进程统计实际消费的样本；移除诊断字段后再传官方模型/损失。
+            for target in targets:
+                crop_attempts += int(target.pop("small_crop_attempted"))
+                crop_applied += int(target.pop("small_crop_applied"))
             images = images.to(device)
             device_targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
             predictions = model(images.float(), targets=device_targets)
@@ -598,6 +627,12 @@ def run_training(config: TrainingConfig, output: Path) -> None:
             total_loss += float(loss.detach()) * batch_count
             total_images += batch_count
             del predictions, losses, loss
+        if config.small_crop.probability:
+            append_csv(output / "small_crop_history.csv", {
+                "epoch": epoch + 1, "images": total_images, "attempted": crop_attempts,
+                "applied": crop_applied, "fallback": crop_attempts - crop_applied,
+                "applied_fraction": crop_applied / max(total_images, 1),
+            })
         ap50, ap, per_class, domains = validate_epoch(ema.module, val_loader, device, config)
         if not math.isfinite(ap) or not math.isfinite(ap50):
             raise FloatingPointError("验证指标非有限值，拒绝保存为正常检查点")
