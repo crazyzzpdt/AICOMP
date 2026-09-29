@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 import torch
 import ultralytics
-from ultralytics.data.augment import Compose, LetterBox, Mosaic, RandomPerspective
+from ultralytics.data.augment import Compose, LetterBox, Mosaic, RandomFlip, RandomPerspective
 from ultralytics.data.build import InfiniteDataLoader, seed_worker
 from ultralytics.data.dataset import YOLODataset
 from ultralytics.data.utils import get_hash
@@ -275,15 +275,119 @@ class FloatPerspective(RandomPerspective):
         return labels
 
 
+@dataclass(frozen=True)
+class SmallObjectCrop:
+    """训练期原图裁剪；默认关闭，旧配方与所有验证输入不变。"""
+
+    probability: float = 0.0  # 主样本尝试概率；不是额外重复采样比例
+    min_fraction: float = 0.6  # 同时裁取原宽、高的至少60%，保留局部上下文
+    max_fraction: float = 0.8  # 最大保留80%；目标线性放大约1.25–1.67倍
+    max_object_size: float = 64.0  # 按完整图长边缩放后的框面积平方根筛选，单位像素
+    min_visibility: float = 0.8  # 任意相交框保留不足80%时放弃窗口，不制造无标注碎片
+    attempts: int = 6  # 窗口失败后有限重试，全部失败就使用原增强流程
+
+    def __post_init__(self) -> None:
+        if not (0 <= self.probability <= 1 and 0 < self.min_fraction <= self.max_fraction < 1
+                and math.isfinite(self.max_object_size) and self.max_object_size > 0
+                and 0 < self.min_visibility <= 1 and type(self.attempts) is int and 1 <= self.attempts <= 20):
+            raise ValueError("小目标裁剪概率、尺寸、可见比例或尝试次数不合法")
+
+
+def choose_small_object_crop(boxes: np.ndarray, classes: np.ndarray, shape: tuple[int, int],
+                             imgsz: int, config: SmallObjectCrop) -> tuple[tuple[int, int, int, int], np.ndarray, np.ndarray] | None:
+    """由归一化xywh选择原图窗口，返回同步框；不修改官方标注数组。"""
+    if not len(boxes):
+        return None
+    height, width = shape
+    xywh = boxes.astype(np.float32, copy=True) * np.array([width, height, width, height], np.float32)
+    xyxy = np.concatenate((xywh[:, :2] - xywh[:, 2:] / 2, xywh[:, :2] + xywh[:, 2:] / 2), axis=1)
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clip(0, width)
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clip(0, height)
+    wh = xyxy[:, 2:] - xyxy[:, :2]
+    area = wh.prod(axis=1)
+    eligible = np.flatnonzero((area > 0) & (np.sqrt(area) * imgsz / max(shape) < config.max_object_size))
+    if not len(eligible):
+        return None
+    categories = classes.reshape(-1)
+    for _ in range(config.attempts):
+        # 先在本图符合尺寸的类别中等概率选类，避免person框数多就独占所有窗口。
+        category = random.choice(np.unique(categories[eligible]).tolist())
+        target = random.choice(eligible[categories[eligible] == category].tolist())
+        fraction = random.uniform(config.min_fraction, config.max_fraction)
+        crop_w, crop_h = max(1, round(width * fraction)), max(1, round(height * fraction))
+        x1, y1, x2, y2 = xyxy[target]
+        min_x, max_x = max(0, math.ceil(x2 - crop_w)), min(width - crop_w, math.floor(x1))
+        min_y, max_y = max(0, math.ceil(y2 - crop_h)), min(height - crop_h, math.floor(y1))
+        if min_x > max_x or min_y > max_y:
+            continue
+        left, top = random.randint(min_x, max_x), random.randint(min_y, max_y)
+        clipped = xyxy.copy()
+        clipped[:, [0, 2]] = clipped[:, [0, 2]].clip(left, left + crop_w)
+        clipped[:, [1, 3]] = clipped[:, [1, 3]].clip(top, top + crop_h)
+        visible_area = (clipped[:, 2:] - clipped[:, :2]).prod(axis=1)
+        keep = visible_area > 0
+        if np.any(visible_area[keep] / np.maximum(area[keep], 1e-9) < config.min_visibility):
+            continue
+        clipped = clipped[keep] - np.array([left, top, left, top], np.float32)
+        normalized = np.concatenate(((clipped[:, :2] + clipped[:, 2:]) / 2,
+                                     clipped[:, 2:] - clipped[:, :2]), axis=1)
+        normalized /= np.array([crop_w, crop_h, crop_w, crop_h], np.float32)
+        return (left, top, crop_w, crop_h), keep, normalized
+    return None
+
+
 class FloatYOLODataset(MultimodalYOLODataset):
     """新训练的连续浮点协议，不读取旧融合缓存。"""
 
     retain_buffer_images: bool = False
 
-    def __init__(self, *args: Any, sensors: SensorAugment, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, sensors: SensorAugment,
+                 small_crop: SmallObjectCrop = SmallObjectCrop(), **kwargs: Any) -> None:
         self.sensors = sensors
+        self.small_crop, self.crop_enabled = small_crop, True
         self.metric_depth: dict[int, bool] = {}
         super().__init__(*args, **kwargs)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        """只对主训练样本裁原图；Mosaic附加图继续走原get_image_and_label。"""
+        attempted = (self.augment and self.crop_enabled and self.small_crop.probability > 0
+                     and random.random() < self.small_crop.probability)
+        sample = self.get_small_crop(index) if attempted else None
+        applied = sample is not None
+        if applied:
+            sample = self.crop_transforms(sample)
+        else:
+            sample = super().__getitem__(index)
+        sample["small_crop_attempted"], sample["small_crop_applied"] = bool(attempted), applied
+        return sample
+
+    def get_small_crop(self, index: int) -> dict[str, Any] | None:
+        """在任何下采样之前裁取五通道原图，避免放大已经丢失细节的小图。"""
+        label = deepcopy(self.labels[index])
+        if label["bbox_format"] != "xywh" or not label["normalized"] or len(label.get("segments", [])):
+            raise ValueError("小目标裁剪仅支持归一化xywh检测框")
+        original_hw = tuple(label["shape"])
+        proposal = choose_small_object_crop(label["bboxes"], label["cls"], original_hw, self.imgsz, self.small_crop)
+        if proposal is None:
+            return None
+        (left, top, width, height), keep, boxes = proposal
+        image = self.load_fused_image(index)
+        if image.shape[:2] != original_hw:
+            raise ValueError("原图尺寸与标签缓存不一致，不能应用裁剪窗口")
+        cropped = image[top:top + height, left:left + width].copy()
+        del image
+        resized = self.resize_native_image(cropped)
+        label.pop("shape")
+        label.update({"img": augment_sensors(resized, self.metric_depth[index], self.sensors),
+                      "bboxes": boxes, "cls": label["cls"][keep], "ori_shape": (height, width),
+                      "resized_shape": resized.shape[:2],
+                      "ratio_pad": (resized.shape[0] / height, resized.shape[1] / width)})
+        return self.update_labels_info(label)
+
+    def close_mosaic(self, hyp: Any) -> None:
+        """与既有收尾阶段同时关闭裁剪，有限轮次加载器将新状态传入worker。"""
+        self.crop_enabled = False
+        super().close_mosaic(hyp)
 
     def load_fused_image(self, index: int) -> np.ndarray:
         path = Path(self.im_files[index])
@@ -326,6 +430,12 @@ class FloatYOLODataset(MultimodalYOLODataset):
                     composition.transforms[index] = Compose([])
 
         replace_geometry(transforms)
+        # 裁剪已决定目标可见性，不再叠加Mosaic、缩放平移或第二次裁框。
+        self.crop_transforms = Compose([
+            FloatLetterBox(new_shape=(self.imgsz, self.imgsz), scaleup=False),
+            RandomFlip(p=hyp.fliplr, direction="horizontal"),
+            deepcopy(transforms.transforms[-1]),
+        ])
         return transforms
 
 
@@ -432,6 +542,7 @@ class FusionRecipe:
     continuous_depth: bool = False
     freeze_bn_stats: bool = False  # 小批次可固定预训练BN统计；仿射参数仍参与优化
     sensors: SensorAugment = SensorAugment()
+    small_crop: SmallObjectCrop = SmallObjectCrop()
 
 
 def sampling_group(path: str) -> str:
@@ -920,6 +1031,9 @@ class FusionDetectionTrainer(DetectionTrainer):
         self.reliability_fusion = recipe.architecture == "reliability_v28"
         self.native_square = recipe.geometry == "native_square"
         self.continuous_depth = recipe.continuous_depth
+        if recipe.small_crop.probability and (not recipe.continuous_depth or not self.native_square):
+            raise ValueError("小目标裁剪只支持连续FP32原生方形三模态训练")
+        self.crop_counts: dict[int, Counter[str]] = {}
         self.recipe_version = EARLY_FUSION_VERSION if self.early_fusion else FUSION_VERSION
         if recipe.split_stem:
             self.recipe_version = SPLIT_STEM_VERSION
@@ -1044,6 +1158,11 @@ class FusionDetectionTrainer(DetectionTrainer):
             raise ValueError("RGB诊断网络只接收NCHW三通道，不能误传旧五通道或v19支持张量")
         if self.recipe.repeat_threshold:
             self.train_loader.sampler.record_batch(batch)
+        if self.recipe.small_crop.probability:
+            counts = self.crop_counts.setdefault(self.epoch, Counter())
+            counts["images"] += len(batch["img"])
+            counts["attempted"] += sum(batch.pop("small_crop_attempted"))
+            counts["applied"] += sum(batch.pop("small_crop_applied"))
         return super().preprocess_batch(batch)
 
     def _validate_training_stage(self) -> None:
@@ -1237,7 +1356,7 @@ class FusionDetectionTrainer(DetectionTrainer):
                 single_cls=False, stride=32, pad=0.0, prefix=f"{mode}: ", task="detect",
                 classes=None, data=self.data, fraction=1.0,
                 polish_scale=self.recipe.polish_scale, polish_translate=self.recipe.polish_translate,
-                **({"sensors": self.recipe.sensors} if self.continuous_depth else {}),
+                **({"sensors": self.recipe.sensors, "small_crop": self.recipe.small_crop} if self.continuous_depth else {}),
             )
         return RectangularDataset(img_path=img_path, imgsz=self.args.imgsz, batch_size=batch,
                                   augment=mode == "train", hyp=copy(self.args), rect=False, cache=False,
@@ -1511,6 +1630,13 @@ class FusionDetectionTrainer(DetectionTrainer):
         if self.recipe.repeat_threshold:
             self.train_loader.sampler.finish_epoch(self.save_dir, self.sampling_attempts[self.epoch])
         metrics, _ = super().validate()
+        if self.recipe.small_crop.probability:
+            counts = self.crop_counts.pop(self.epoch, Counter())
+            append_csv(self.save_dir / "small_crop_history.csv", [{
+                "epoch": self.epoch + 1, "images": counts["images"], "attempted": counts["attempted"],
+                "applied": counts["applied"], "fallback": counts["attempted"] - counts["applied"],
+                "applied_fraction": counts["applied"] / max(counts["images"], 1),
+            }])
         fitness = float(metrics["metrics/mAP50-95(B)"])
         # 原生fitness当前也是AP95，显式锁定以免框架版本改变选择语义。
         self.best_fitness = max(self.best_fitness or 0.0, fitness)

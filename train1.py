@@ -1,9 +1,9 @@
-"""v28复赛候选：YOLO26x局部质量融合、浅层细节注入与100轮日程。
+"""v29小目标训练：保留v28局部质量融合，新增受限原图裁剪。
 
 使用官方原标签1900/100整组划分，1536原生方形输入；不继承L规模历史权重。
 运行：uv run python train1.py。与train2.py分别启动，不同时占用GPU。
 训练验证与预测均最多保留100框，展示阈值不影响提交标签。
-RGB骨干独立，IR/Depth轻量分支以P3–P5残差融合；新增结构尚未正式训练。
+RGB骨干独立，IR/Depth轻量分支以P3–P5残差融合；验证预测仍使用完整图。
 """
 
 # 内置库
@@ -21,7 +21,7 @@ os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 from ultralytics import YOLO
 
 # 自己的模块
-from src.yolo.aic.training import FusionDetectionTrainer, FusionRecipe
+from src.yolo.aic.training import FusionDetectionTrainer, FusionRecipe, SmallObjectCrop
 from src.modalities import SensorAugment, configure_fp32
 
 
@@ -33,7 +33,7 @@ DATA_PATH: str = "./datasets/data.yaml"
 DATA_AUDIT: str = "./runs/dataset_cleaning/official_labels_split_1900_100_v27/manifest.json"
 # 由入口位置解析绝对输出目录，避免框架拼接全局runs_dir造成路径重复。
 PROJECT_PATH: str = str(Path(__file__).resolve().parent / "runs" / "detect")
-RUN_NAME: str = "AIC_RGBIRDepth_yolo26x_1536_v28_reliability"
+RUN_NAME: str = "AIC_RGBIRDepth_yolo26x_1536_v29_small_crop"
 # 1536方形等比填充；展示图片与TXT坐标仍还原到原图。
 IMAGE_HW: tuple[int, int] = (1536, 1536)
 # 官方X基底重新迁移，在100轮内完成余弦衰减，避免早停前学习率长期偏高。
@@ -42,8 +42,8 @@ MAX_EPOCHS: int = 100
 POLISH_START_EPOCH: int = 41
 # 不设置AP硬门槛；独立预算与总日程一致，连续50轮无提升可提前停止。
 BUDGET_EPOCHS: int = MAX_EPOCHS
-# 新浮点协议只从官方基底开始，不接入旧训练状态。
-RESUME_PATH: str | None = r"runs\detect\AIC_RGBIRDepth_yolo26x_1536_v28_reliability\weights\last.pt"
+# v29从官方基底重新迁移；中断后只填本轮同配方的last.pt，不恢复已完成v28。
+RESUME_PATH: str | None = None
 
 
 # Windows DataLoader子进程会重新导入脚本，正式训练必须放在入口保护内。
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     os.chdir(Path(__file__).resolve().parent)
     configure_fp32()
 
-    # 保留训练器与数据审计；只允许恢复当前v28同配方未完成的last.pt。
+    # 保留训练器与数据审计；只允许恢复当前v29同配方未完成的last.pt。
     trainer = partial(FusionDetectionTrainer, recipe=FusionRecipe(
         architecture="reliability_v28",  # RGB独立骨干+轻量IR/Depth分支，P3/P4/P5质量门控融合
         continuous_depth=True,  # 原始16位深度直接转FP32，不经过8位取整
@@ -61,6 +61,14 @@ if __name__ == "__main__":
             ir_local_probability=0.0,  # 关闭新增局部对比度，不更改基础归一化
             rgb_exposure_probability=0.0,  # 关闭新增RGB曝光扰动
         ),  # 保留深度有效区扰动；这些随机增强不用于验证/推理
+        small_crop=SmallObjectCrop(
+            probability=0.25,  # 25%的主训练样本尝试裁剪；失败回退，不增加每轮图片数
+            min_fraction=0.6,  # 同步裁取RGB/IR/Depth原宽高至少60%，保留周边场景
+            max_fraction=0.8,  # 最多保留80%；先裁原图再缩放，避免放大已下采样的细节
+            max_object_size=64.0,  # 全图缩放到1536后，框面积平方根小于64像素才作为锚点
+            min_visibility=0.8,  # 任意相交框不足80%可见就拒绝窗口；不丢标保留碎片
+            attempts=6,  # 最多六次找窗口；裁剪分支不再叠加Mosaic和随机平移缩放
+        ),  # 第41轮与Mosaic一起关闭；验证/预测不裁剪，磁盘原图和标签不改
         split_stem=False,  # 不引入v18拆分首层或v19分支
         budget_epochs=BUDGET_EPOCHS,  # 允许完整100轮日程，不用首轮AP判断最终上限
         training_stage="main",  # 官方基底重新训练，不走v15已有五通道微调路径
