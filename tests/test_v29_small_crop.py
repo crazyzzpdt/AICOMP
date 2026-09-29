@@ -11,7 +11,8 @@ from ultralytics.data.augment import Format
 from ultralytics.data.dataset import YOLODataset
 
 from src.modalities import SensorAugment
-from src.yolo.aic.training import FloatYOLODataset, SmallObjectCrop, choose_small_object_crop
+from src.yolo.aic.training import FloatYOLODataset
+from src.augmentation import SmallObjectCrop, choose_small_object_crop
 
 
 def test_crop_preserves_target_and_keeps_source_labels():

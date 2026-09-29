@@ -18,7 +18,7 @@ from src.dfine.runtime import (build_model as build_dfine_runtime_model,
 DFINE_COMMIT = "956d1709314c2c6a4df6f34de232054578a7449f"
 DFINE_PREPROCESS_VERSION = "rgbirdepth_uint8_letterbox_div255_v1"
 DFINE_CHECKPOINT_FORMAT = "aic_dfine_5ch_v2"
-SOURCE_PATHS = ("predict2.py", "src/__init__.py", "src/prediction_io.py", "src/modalities.py",
+SOURCE_PATHS = ("predict2.py", "src/__init__.py", "src/prediction_io.py", "src/modalities.py", "src/augmentation.py",
                 "src/dfine", "src/D-FINE", "tools/__init__.py",
                 "tools/IntegrateAndPackage.py", "tools/md2pdf")
 
