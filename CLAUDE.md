@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+2026-10-01最新：YOLO v29完成67轮、best17 AP95=0.4185063153，低于v28且后期过拟合，不续训last。train1已准备v30_context_crop：裁剪尝试率0.10、宽高比例0.75–0.90，其余网络/日程/1536/FP32/batch1/nbs16不改。D-FINE v29无已完成产物，train2保留；官方1900/100与用户predict1的v29/conf0.5保持。未新增测试、训练、预测或复评，用户自行开训，源码文档先存Git基点。详见AGENTS最新记录和docs/v29小目标训练方案.md。
+
 2026-09-29双框架追加：train2已授权接D-FINE-X v29_small_crop，保留原五通道/60轮/FP32/batch1，裁剪与YOLO共用src/augmentation.py，第41轮关闭；不移植尚未独立验证的YOLO门控。19项CPU数据检查通过，未开训/推理。用户授权分步Git提交并推送GitHub。下方train2不改为历史状态；按AGENTS最新记录和v29文档执行。
 
 2026-09-29当前：train1为待训练v29_small_crop，用户选择保留YOLO26x/v28结构、官方1900/100与1536 FP32 batch1；只新增受限小目标原图训练裁剪，第41轮关闭。15项CPU检查通过，未正式训练或GPU检查。predict1用户v28默认、train2均不改。详情及恢复边界以AGENTS最新段落和docs/v29小目标训练方案.md为准；下方v28尚未训练等为历史状态。
