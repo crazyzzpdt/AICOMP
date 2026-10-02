@@ -10,6 +10,7 @@
 | `dfine/prediction.py` | D-FINE专用预测及历史输入兼容；入口为根目录predict2.py |
 | `dfine/training.py` | 项目D-FINE五通道训练适配 |
 | `dfine/runtime.py` | 项目D-FINE构建、源码验证和坐标解码 |
+| `dfine/reliability.py` | D-FINE v28独立RGB骨干与轻量IR/Depth分支、局部质量残差和P2细节融合，训练预测共用 |
 | `D-FINE/src/`、`D-FINE/configs/` | 上游D-FINE实现与配置；目录层级保留，避免破坏源码清单及相对配置 |
 
 `D-FINE`（带连字符）是上游源码目录；`dfine`（小写）是项目可导入包，二者有明确分工。上游工具在根目录 `tools/dfine/`，历史代码在 `tools/archive/run_snapshots/`。

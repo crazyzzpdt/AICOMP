@@ -43,7 +43,9 @@ import yaml
 from src.augmentation import SmallObjectCrop, choose_small_object_crop
 from src.modalities import (CLASS_NAMES, IMAGE_SUFFIXES, FLOAT_PREPROCESS_VERSION, SensorAugment,
                             read_float_modalities, letterbox_float, augment_sensors, configure_fp32)
-from src.dfine.runtime import check_source, build_model, decode_predictions
+from src.dfine.runtime import (check_source, build_model, decode_predictions,
+                               EARLY_FUSION_ARCHITECTURE, RELIABILITY_CHECKPOINT_FORMAT)
+from src.dfine.reliability import AUXILIARY_PREFIXES, RELIABILITY_ARCHITECTURE
 
 
 # 固定官方源码版本，避免本机更新第三方仓库后静默改变训练行为。
@@ -98,7 +100,7 @@ class TrainingConfig:
     seed: int
     save_period: int
     resume: str | None
-    # 新训练不恢复旧优化状态；裁剪默认关闭，只有v29入口显式开启。
+    # 新训练不恢复旧优化状态；v28结构实验关闭裁剪，保留可选实现供历史追溯。
     sensors: SensorAugment = SensorAugment()
     small_crop: SmallObjectCrop = SmallObjectCrop()
     loss_vfl: float = 1.0
@@ -111,6 +113,8 @@ class TrainingConfig:
     domain_metrics: bool = True
     data_audit: str | None = None
     variant: str = "l"  # 写入检查点，预测按此选择真实L/X结构；历史缺省为L
+    architecture: str = EARLY_FUSION_ARCHITECTURE  # 入口显式开启v28，旧权重仍可预测
+    auxiliary_lr: float = 0.0001  # v28随机初始化辅助分支独立学习率
 
 
 def transfer_pretrained(model: nn.Module, weights: Path) -> dict[str, object]:
@@ -128,7 +132,12 @@ def transfer_pretrained(model: nn.Module, weights: Path) -> dict[str, object]:
     state: dict[str, torch.Tensor] = {}
     regenerated: list[str] = []
     remapped: list[str] = []
+    initialized: list[str] = []
+    reliability = getattr(model, "architecture", None) == RELIABILITY_ARCHITECTURE
     for name, value in target.items():
+        if reliability and name.startswith(AUXILIARY_PREFIXES):
+            initialized.append(name)
+            continue
         if name in {"decoder.anchors", "decoder.valid_mask"}:
             regenerated.append(name)
             continue
@@ -137,6 +146,10 @@ def transfer_pretrained(model: nn.Module, weights: Path) -> dict[str, object]:
             raise ValueError(f"官方权重缺少模型参数：{name}")
         incoming = source[name]
         if name == "backbone.stem.stem1.conv.weight":
+            if (incoming.ndim != 4 or incoming.shape[1] != 3
+                    or value.shape[1] != (3 if reliability else 5)
+                    or incoming.shape[0] != value.shape[0] or incoming.shape[2:] != value.shape[2:]):
+                raise ValueError("官方RGB首层与所选D-FINE结构不匹配")
             adapted = torch.zeros_like(value)
             adapted[:, :3] = incoming
             state[name] = adapted
@@ -155,13 +168,14 @@ def transfer_pretrained(model: nn.Module, weights: Path) -> dict[str, object]:
         else:
             raise ValueError(f"官方权重结构不匹配：{name}，{tuple(incoming.shape)} → {tuple(value.shape)}")
     missing, unexpected = model.load_state_dict(state, strict=False)
-    if set(missing) != set(regenerated) or unexpected:
+    if set(missing) != set(regenerated + initialized) or unexpected:
         raise ValueError(f"权重迁移存在未处理参数：{missing}, {unexpected}")
     stem = model.backbone.stem.stem1.conv
     if not stem.weight.requires_grad:
-        raise ValueError("五通道输入层被意外冻结，红外和深度将无法学习")
+        raise ValueError("D-FINE输入层被意外冻结，请检查预训练迁移配置")
     return {"loaded_tensors": len(state), "remapped_heads": remapped,
-            "regenerated_buffers": regenerated, "class_initialization": OBJECTS365_ROWS}
+            "regenerated_buffers": regenerated, "initialized_auxiliary": initialized,
+            "class_initialization": OBJECTS365_ROWS}
 
 
 
@@ -428,6 +442,10 @@ def train(config: TrainingConfig) -> None:
     """创建独立运行目录并执行固定预算微调；只能由 train2.py 显式调用。"""
     if config.variant not in {"l", "x"}:
         raise ValueError("variant必须显式选择l或x")
+    if config.architecture not in {EARLY_FUSION_ARCHITECTURE, RELIABILITY_ARCHITECTURE}:
+        raise ValueError("未知D-FINE训练结构，不能猜测或回退")
+    if not math.isfinite(config.auxiliary_lr) or config.auxiliary_lr <= 0:
+        raise ValueError("辅助分支学习率必须为有限正数")
     if config.imgsz < 32 or config.imgsz % 32 or min(config.batch, config.val_batch, config.effective_batch) < 1 or config.effective_batch % config.batch:
         raise ValueError("imgsz 必须为 32 的倍数；effective_batch 必须为 batch 的正整数倍")
     if config.epochs <= config.warmup_epochs or config.warmup_epochs < 0 or not 0 < config.scale_min <= 1 or not 0 <= config.polish_epoch < config.epochs:
@@ -481,7 +499,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     training = MultimodalDFineDataset(PROJECT_ROOT / config.data, "train", config)
     validation = MultimodalDFineDataset(PROJECT_ROOT / config.data, "val", config)
     adapter_hashes = {name: hashlib.sha256((PROJECT_ROOT / name).read_bytes()).hexdigest()
-                      for name in ("src/dfine/__init__.py", "src/dfine/training.py", "src/modalities.py", "src/augmentation.py", "src/dfine/runtime.py", "src/D-FINE/source_manifest.json")}
+                      for name in ("src/dfine/__init__.py", "src/dfine/training.py", "src/dfine/reliability.py", "src/modalities.py", "src/augmentation.py", "src/dfine/runtime.py", "src/D-FINE/source_manifest.json")}
     if {p.stem for p in training.images} & {p.stem for p in validation.images}:
         raise ValueError("训练和验证存在同名样本，停止训练以避免泄漏")
     audit_hash: str | None = None
@@ -507,7 +525,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
                     digest = hashlib.file_digest(handle, "sha256").hexdigest()
                 if digest != sample.get("source_hashes", {}).get(modality):
                     raise ValueError(f"三模态来源与清洗审计不符：{path.name}/{modality}")
-    model, criterion = build_model(config.imgsz, training=True, variant=config.variant)
+    model, criterion = build_model(config.imgsz, training=True, variant=config.variant, architecture=config.architecture)
     if criterion is None:
         raise RuntimeError("未创建官方 D-FINE 损失函数")
     criterion.weight_dict.update({"loss_vfl": config.loss_vfl, "loss_bbox": config.loss_bbox,
@@ -517,9 +535,15 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     model.to(device)
     criterion.to(device)
     groups: dict[tuple[float, float], list[nn.Parameter]] = {}
+    reliability = config.architecture == RELIABILITY_ARCHITECTURE
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
-            lr = config.backbone_lr if name.startswith("backbone.") and not name.startswith("backbone.stem.stem1.conv.") else config.lr0
+            if reliability and name.startswith(AUXILIARY_PREFIXES):
+                lr = config.auxiliary_lr
+            elif name.startswith("backbone.") and (reliability or not name.startswith("backbone.stem.stem1.conv.")):
+                lr = config.backbone_lr
+            else:
+                lr = config.lr0
             decay = config.weight_decay if parameter.ndim > 1 and not name.endswith("bias") else 0.0
             groups.setdefault((lr, decay), []).append(parameter)
     optimizer = torch.optim.AdamW([{"params": values, "lr": lr, "initial_lr": lr, "weight_decay": decay}
@@ -540,12 +564,24 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     total_updates = sum(epoch_updates)
     warmup_updates = sum(count * min(1.0, max(0.0, config.warmup_epochs - epoch))
                          for epoch, count in enumerate(epoch_updates))
-    recipe = {"format": CHECKPOINT_FORMAT, "dfine_commit": DFINE_COMMIT, "preprocess": PREPROCESS_VERSION,
+    recipe = {"format": RELIABILITY_CHECKPOINT_FORMAT if reliability else CHECKPOINT_FORMAT,
+              "architecture": config.architecture, "dfine_commit": DFINE_COMMIT, "preprocess": PREPROCESS_VERSION,
               "config": asdict(config), "classes": CLASS_NAMES, "transfer": transfer,
               "train_images": len(training), "val_images": len(validation),
               "dataset_signatures": [training.signature, validation.signature]}
     recipe["data_audit_sha256"] = audit_hash
     recipe["adapter_sha256"] = adapter_hashes
+    recipe["optimizer_groups"] = [
+        {"lr": lr, "weight_decay": decay, "parameters": sum(parameter.numel() for parameter in values)}
+        for (lr, decay), values in groups.items()
+    ]
+    recipe["reliability_fusion"] = {
+        "enabled": reliability, "levels": ["P3", "P4", "P5"] if reliability else [],
+        "rgb_backbone_independent": reliability, "p2_detail_to_p3": reliability,
+        "infrared_local_alignment": ["P3", "P4"] if reliability else [],
+        "depth_valid_support": reliability, "zero_residual_initialization": reliability,
+        "auxiliary_activation_checkpointing": reliability,
+    }
     recipe["label_geometry"] = {
         "policy": "clip_to_image_bounds_v1", "source_files_modified": False,
         "degenerate_boxes": "error",
@@ -577,12 +613,14 @@ def run_training(config: TrainingConfig, output: Path) -> None:
     snapshot.mkdir()
     if config.data_audit:
         shutil.copy2(PROJECT_ROOT / config.data_audit, output / "dataset_audit.json")
-    for filename in ("train2.py", "predict2.py", "predict1.py", "src/__init__.py", "src/dfine/__init__.py", "src/dfine/training.py",
+    for filename in ("train2.py", "predict2.py", "src/__init__.py", "src/dfine/__init__.py", "src/dfine/training.py",
+                     "src/dfine/reliability.py", "src/dfine/prediction.py", "src/prediction_io.py",
                      "src/D-FINE/source_manifest.json", "src/modalities.py", "src/augmentation.py", "src/dfine/runtime.py", "pyproject.toml", "uv.lock"):
         target = snapshot / filename
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(PROJECT_ROOT / filename, target)
     print(f"D-FINE-{config.variant.upper()} 五通道训练：{len(training)} train / {len(validation)} val，{config.imgsz}px，{start_epoch + 1}–{config.epochs} 轮")
+    print(f"网络结构：{config.architecture}；小目标裁剪尝试率：{config.small_crop.probability}")
     print(f"迁移记录：{transfer}\n结果目录：{output}\nFP32 前向、损失与EMA；物理批次 {config.batch}，有效批次 {config.effective_batch}")
     accumulate = config.effective_batch // config.batch
     started = time.monotonic()
@@ -659,6 +697,7 @@ def run_training(config: TrainingConfig, output: Path) -> None:
         append_csv(output / "results.csv", {"epoch": epoch + 1, "time": time.monotonic() - started,
                    "train/loss": total_loss / total_images, "metrics/mAP50(B)": ap50, "metrics/mAP50-95(B)": ap,
                    "lr/head": config.lr0 * factor, "lr/backbone": config.backbone_lr * factor,
+                   **({"lr/auxiliary": config.auxiliary_lr * factor} if reliability else {}),
                    "train/samples": total_images, "train/optimizer_updates": epoch_updates[epoch]})
         for row in per_class:
             append_csv(output / "per_class_metrics.csv", {"epoch": epoch + 1, **row})

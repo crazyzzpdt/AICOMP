@@ -13,7 +13,9 @@ from ultralytics.engine.results import Results
 
 from src.modalities import CLASS_NAMES, FLOAT_PREPROCESS_VERSION, configure_fp32, read_float_modalities, letterbox_float
 from src.dfine.runtime import (build_model as build_dfine_runtime_model,
-                               decode_predictions as decode_dfine_runtime_predictions)
+                               decode_predictions as decode_dfine_runtime_predictions,
+                               EARLY_FUSION_ARCHITECTURE, RELIABILITY_CHECKPOINT_FORMAT)
+from src.dfine.reliability import RELIABILITY_ARCHITECTURE
 
 DFINE_COMMIT = "956d1709314c2c6a4df6f34de232054578a7449f"
 DFINE_PREPROCESS_VERSION = "rgbirdepth_uint8_letterbox_div255_v1"
@@ -78,7 +80,7 @@ class DFinePredictor:
         configure_fp32()
         self.imgsz = imgsz
         checkpoint = torch.load(weights, map_location="cpu", weights_only=False)
-        if checkpoint.get("format") not in {DFINE_CHECKPOINT_FORMAT, "aic_dfine_l_5ch_v1"} or checkpoint.get("dfine_commit") != DFINE_COMMIT:
+        if checkpoint.get("format") not in {DFINE_CHECKPOINT_FORMAT, "aic_dfine_l_5ch_v1", RELIABILITY_CHECKPOINT_FORMAT} or checkpoint.get("dfine_commit") != DFINE_COMMIT:
             raise ValueError("不是本项目固定版本的 D-FINE 五通道权重")
         if checkpoint.get("preprocess") not in {DFINE_PREPROCESS_VERSION, FLOAT_PREPROCESS_VERSION} or list(checkpoint["classes"]) != list(CLASS_NAMES):
             raise ValueError("权重的预处理或类别顺序与当前预测代码不符")
@@ -89,9 +91,18 @@ class DFinePredictor:
         self.training_sensor_augmentation = checkpoint["config"].get("sensors")
         self.input_geometry = "float_dfine" if self.continuous_depth else "fixed_rect"
         self.variant = checkpoint["config"].get("variant", "l")
-        if checkpoint.get("format") == DFINE_CHECKPOINT_FORMAT and "variant" not in checkpoint["config"]:
+        if checkpoint.get("format") in {DFINE_CHECKPOINT_FORMAT, RELIABILITY_CHECKPOINT_FORMAT} and "variant" not in checkpoint["config"]:
             raise ValueError("新检查点缺少D-FINE规模，不能猜测L或X")
-        self.model, _ = build_dfine_runtime_model(imgsz, variant=self.variant)
+        self.architecture = checkpoint.get("architecture", EARLY_FUSION_ARCHITECTURE)
+        config_architecture = checkpoint["config"].get("architecture", EARLY_FUSION_ARCHITECTURE)
+        if self.architecture != config_architecture:
+            raise ValueError("D-FINE检查点结构与训练配置不一致")
+        if checkpoint.get("format") == RELIABILITY_CHECKPOINT_FORMAT:
+            if self.architecture != RELIABILITY_ARCHITECTURE or not self.continuous_depth:
+                raise ValueError("v28融合权重必须记录正确结构与连续浮点协议")
+        elif self.architecture != EARLY_FUSION_ARCHITECTURE:
+            raise ValueError("旧格式权重不能冒充v28融合结构")
+        self.model, _ = build_dfine_runtime_model(imgsz, variant=self.variant, architecture=self.architecture)
         self.model.load_state_dict(checkpoint["ema"]["module"], strict=True)
         self.model.to(self.device).float().eval()
         self.names: dict[int, str] = dict(enumerate(CLASS_NAMES))
@@ -176,7 +187,8 @@ def create_backend(config: PredictionConfig):
     """返回D-FINE读图、前向及元数据，共用输出层不负责模型选择。"""
     model = DFinePredictor(config.weights, config.device, config.imgsz)
     metadata = {
-        "backend": "dfine", "variant": model.variant, "dfine_commit": DFINE_COMMIT, "epoch": model.epoch,
+        "backend": "dfine", "variant": model.variant, "architecture": model.architecture,
+        "dfine_commit": DFINE_COMMIT, "epoch": model.epoch,
         "nms": False, "iou": None, "multi_label": None, "rect": False,
         "postprocess": "native_query_class_topk", "preprocess": model.preprocess, "weights_kind": "ema",
         "input_dtype": "float32" if model.continuous_depth else "uint8",

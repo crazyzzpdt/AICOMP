@@ -15,9 +15,13 @@ from torchvision.ops import box_convert
 
 # 自己的模块
 from src.modalities import CLASS_NAMES
+from src.dfine.reliability import RELIABILITY_ARCHITECTURE, ReliabilityDFine
 
 DFINE_COMMIT: str = "956d1709314c2c6a4df6f34de232054578a7449f"
 PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+# 缺少结构字段的历史权重按原五通道首层加载，新结构使用独立格式。
+EARLY_FUSION_ARCHITECTURE: str = "dfine_early_5ch"
+RELIABILITY_CHECKPOINT_FORMAT: str = "aic_dfine_reliability_v28"
 
 
 def check_source() -> Path:
@@ -42,18 +46,23 @@ def check_source() -> Path:
     return source
 
 
-def build_model(imgsz: int, training: bool = False, variant: str = "l") -> tuple[nn.Module, nn.Module | None]:
+def build_model(imgsz: int, training: bool = False, variant: str = "l",
+                architecture: str = EARLY_FUSION_ARCHITECTURE) -> tuple[nn.Module, nn.Module | None]:
     """构建不联网的12类五通道D-FINE-L/X，输入端不冻结。
 
     Args:
         imgsz: 正方形填充尺寸，必须为 32 的倍数。
         training: 是否同时创建官方匹配器与损失函数。
+        variant: 官方L或X规模。
+        architecture: 历史五通道首层，或v28独立RGB与辅助模态融合。
 
     Returns:
         五通道模型，以及训练时使用的损失函数。
     """
     if variant not in {"l", "x"}:
         raise ValueError("D-FINE规模仅支持l或x，不能按文件名静默猜测")
+    if architecture not in {EARLY_FUSION_ARCHITECTURE, RELIABILITY_ARCHITECTURE}:
+        raise ValueError(f"未知D-FINE结构：{architecture}")
     source = check_source()
     from src.core import YAMLConfig
     import src.nn  # noqa: F401
@@ -69,10 +78,13 @@ def build_model(imgsz: int, training: bool = False, variant: str = "l") -> tuple
                  "freeze_at": -1, "freeze_norm": True},
     )
     model = config.model
-    original = model.backbone.stem.stem1.conv
-    expanded = nn.Conv2d(5, original.out_channels, original.kernel_size, original.stride,
-                         original.padding, bias=original.bias is not None)
-    model.backbone.stem.stem1.conv = expanded
+    if architecture == RELIABILITY_ARCHITECTURE:
+        model = ReliabilityDFine(model)
+    else:
+        original = model.backbone.stem.stem1.conv
+        expanded = nn.Conv2d(5, original.out_channels, original.kernel_size, original.stride,
+                             original.padding, bias=original.bias is not None)
+        model.backbone.stem.stem1.conv = expanded
     return model, config.criterion if training else None
 
 
