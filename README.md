@@ -10,12 +10,20 @@
 ![Preliminary best](https://img.shields.io/badge/Preliminary_Best-55.6000-f59e0b?style=flat-square)
 ![Semifinal best](https://img.shields.io/badge/Semifinal_Best-52.8410-16a34a?style=flat-square)
 [![GitHub stars](https://img.shields.io/github/stars/crazyzzpdt/AICOMP?style=flat-square&color=eab308)](https://github.com/crazyzzpdt/AICOMP/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/crazyzzpdt/AICOMP?style=flat-square&color=8b5cf6)](https://github.com/crazyzzpdt/AICOMP/forks)
+[![GitHub watchers](https://img.shields.io/github/watchers/crazyzzpdt/AICOMP?style=flat-square&color=06b6d4)](https://github.com/crazyzzpdt/AICOMP/watchers)
+[![GitHub issues](https://img.shields.io/github/issues/crazyzzpdt/AICOMP?style=flat-square&color=ef4444)](https://github.com/crazyzzpdt/AICOMP/issues)
+![GitHub last commit](https://img.shields.io/github/last-commit/crazyzzpdt/AICOMP?style=flat-square&color=22c55e)
+![GitHub repo size](https://img.shields.io/github/repo-size/crazyzzpdt/AICOMP?style=flat-square&color=64748b)
+![Repository visitors](https://api.visitorbadge.io/api/visitors?path=crazyzzpdt%2FAICOMP&label=Repository%20Visitors&countColor=%230ea5e9&style=flat-square)
 
 [赛事成绩](#赛事成绩) · [项目看点](#项目看点) · [实验状态](#暂停时的代码与实验状态) · [文档导航](#文档入口)
 
 **如果三模态实现、双框架适配或实验复盘对你有帮助，欢迎点亮右上角的 ⭐ Star。**
 
 </div>
+
+> Star、Fork、Watch、Issue、最后提交与仓库大小来自GitHub公开数据。`Repository Visitors`由第三方服务从徽章加入后累计请求量，不代表GitHub官方独立访客。GitHub Clone统计仅仓库所有者可在`Insights → Traffic`查看近14天数据，因此不展示容易误导的公开Clone徽章。
 
 > **项目状态 · 2026-10-05**<br>
 > 本仓库已暂停开发，作为历史代码与实验记录保留。独立重开项目位于本地 `A:\AIC`，公开链接待补；其已提供记录中的复赛最高为 **54.6500**，单独列于下方，**不属于本仓库成果**。本仓库复赛纪录仍为 **52.8410**。
