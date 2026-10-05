@@ -14,15 +14,15 @@ from src.yolo.prediction import PredictionConfig, predict
 
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26x_1536_v28_reliability/weights/best.pt"
+MODEL_PATH: Path = PROJECT_ROOT / "runs/detect/AIC_RGBIRDepth_yolo26x_1536_v29_small_crop/weights/best.pt"
 SOURCE_PATH: Path = PROJECT_ROOT / "datasets/test"
-OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v28"
+OUTPUT_PATH: Path = PROJECT_ROOT / "历史产出/复赛predict_v29_置信度0.1"
 
 
 if __name__ == "__main__":
     predict(PredictionConfig(
         # 一、模型、输入与输出
-        weights=MODEL_PATH,  # 仅接收本项目YOLO .pt权重，保留本轮v27-X选择
+        weights=MODEL_PATH,  # 仅接收本项目YOLO .pt权重，保留用户v29最佳权重选择
         source=SOURCE_PATH,  # visible、infrared、depth同名配对，不改原图或生成缓存
         project=OUTPUT_PATH.parent,  # 预测产出根目录，与训练runs分离
         name=OUTPUT_PATH.name,  # 本次结果目录；再次运行请改名或传--output
@@ -46,8 +46,8 @@ if __name__ == "__main__":
         stream=False,  # 旧YOLO可返回批内生成器；外层始终逐批消费，不积累全部结果
 
         # 三、候选框与后处理
-        conf=0.001,  # 与验证一致保留低分候选，不是展示图片的阈值
-        iou=0.7,  # 一对多检测头的NMS阈值
+        conf=0.1,  # 用户v29阈值实验配置，与训练验证0.001不同；展示阈值见visual_conf
+        iou=0.75,  # 一对多检测头的NMS阈值
         max_det=100,  # 与轮末验证和赛事上限一致，避免密集目标被12框上限截断
         nms=True,  # 保持验证的一对多头，本路径不开放无NMS切换
         agnostic_nms=False,  # 不跨类别压制；True会改变重叠目标筛选口径
