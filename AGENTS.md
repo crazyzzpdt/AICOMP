@@ -1,5 +1,9 @@
 # 仓库协作规范
 
+2026-10-05暂停与归档（最高优先）：用户已在A:\AIC重开项目，明确暂停本仓库提分及清理任务。本轮仅更新README/交接文档，分步提交当前源码删除、工具文档及用户predict1配置，再推送GitHub；此前排除predict1的限制被本次授权更新，参数保持不变。旧仓库复赛最高确认为YOLO v29/conf0.25的52.8410；新版成绩用户称更高但未给数字，不编造或混写。D-FINE v28运行验证/正式训练及固定验证口径误差诊断仍未完成，不自动启动。10月5日只读检查三个runs测试目录已不存在，tests和.pytest_cache仍在，不能声称本轮执行删除或核实释放3.26GiB。数据、权重、runs及replay_pid2916.log不上传，不操作A:\AIC或其他项目进程。最新状态以README为准；下方为历史。
+
+2026-10-03清理状态：用户授权清理无用文件与测试。已通过代码编辑删除5份tests源码及tools/check_train1.py、tools/validate_local.py（Git e43d1c2可恢复，无正式入口引用）；未运行测试。6组旧launch日志移至runs/diagnostics/launch_history同名目录，历史引用需按新位置查找。约3.26 GiB临时测试产物、tests的pycache及pytest缓存的删除被自动审批以blocked by policy拒绝，仍在原位，不能报告空间已释放。runs/detect、dataset_cleaning（约27.24 MiB且两个入口使用）、诊断JSON、独立复评、模态审计和标签备份保留；不触碰其他项目活动进程。用户predict1修改保留，未提交推送。本轮仅清理与文档更新，不改变训练配方。
+
 2026-10-02提交授权追加：用户要求分步提交并推送GitHub，主题为“D-FINE的v28版本，借鉴yolov28相比之前有效提升的方案”。本轮分为D-FINE结构/训练预测适配与文档成绩记录两个提交；保存正式开训前源码基点，不自动启动测试或训练。有效提升指YOLO v28本地AP组合证据，不代表D-FINE已训练或已提分。用户predict1.py未提交修改保留本地，数据/权重/runs不入Git；提交推送结果以Git输出为准。下方未提交推送为此前交付状态。
 
 2026-10-02 D-FINE v28结构实施（最新优先）：用户确认从官方Objects365重新训练，明确下一轮D-FINE命名v28，替换从未开训的v29_small_crop草案；不得改YOLO历史版本。train2现为AIC_RGBIRDepth_dfine_x_1536_v28_reliability、architecture=dfine_reliability_p345_v28_1，独立RGB HGNetv2-B5＋轻量GN的IR/Depth分支、P3/P4局部软对应、P3–P5质量残差及P2细节到P3。60轮/1536/FP32/batch1/有效16/预热5/patience50/第41轮收尾保留，骨干含RGB首层1e-5、编码器解码器5e-5、新分支1e-4，裁剪关闭。新格式aic_dfine_reliability_v28，训练预测同构建器，架构字段不一致拒绝；旧D-FINE预测保留，predict2默认v27不改。新模块在src/dfine/reliability.py，不导入YOLO或改上游，源码快照和迁移白名单已接入。仅源码/Git文本核对，未测试/静态执行检查/模型前向/训练/推理，不宣称显存或提分已通过，不自动启动。数据原标签1900/100和predict1用户改动不动。正式训练前仍须源码文档Git基点，本次未提交推送。详见docs/v28复赛训练方案.md；下方D-FINE待训练v29/结构未移植/待回复为历史。
